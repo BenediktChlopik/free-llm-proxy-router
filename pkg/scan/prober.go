@@ -21,8 +21,8 @@ type Prober struct {
 
 // ProbeResult holds the outcome of a probe call.
 type ProbeResult struct {
-	ProviderID string
-	ModelID    string
+	ProviderID   string
+	ModelID      string
 	IsAccessible bool
 	StatusCode   int
 	ErrMsg       string
@@ -43,7 +43,12 @@ func (p *Prober) Probe(ctx context.Context, entry catalog.CatalogEntry, cfg conf
 		payload["service_tier"] = cfg.NativeFeatures.ServiceTier
 	}
 
-	data, _ := json.Marshal(payload)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return ProbeResult{ProviderID: cfg.ID, ModelID: entry.ModelID, ErrMsg: err.Error()}
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(data))
 	if err != nil {
 		return ProbeResult{ProviderID: cfg.ID, ModelID: entry.ModelID, ErrMsg: err.Error()}
@@ -58,15 +63,15 @@ func (p *Prober) Probe(ctx context.Context, entry catalog.CatalogEntry, cfg conf
 		req.Header.Set(k, val)
 	}
 
-	ctx2, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-	req = req.WithContext(ctx2)
-
-	resp, err := p.Client.Do(req)
+	client := p.Client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return ProbeResult{ProviderID: cfg.ID, ModelID: entry.ModelID, ErrMsg: err.Error()}
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 
 	// 200 or streaming 200 = accessible
@@ -79,8 +84,9 @@ func (p *Prober) Probe(ctx context.Context, entry catalog.CatalogEntry, cfg conf
 		}
 	}
 
-	// 429 on a "free" model → needs reverification (might be rate-limited, not paid)
-	// 402/403 → not free
+	// 429 on a "free" model → needs reverification (might be rate-limited, not paid).
+	// 402/404 are definitive: the model is paid or no longer exists. The probe
+	// command removes those entries; 403 can also be an account/auth issue.
 	return ProbeResult{
 		ProviderID:   cfg.ID,
 		ModelID:      entry.ModelID,

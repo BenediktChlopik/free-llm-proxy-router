@@ -20,14 +20,19 @@ import (
 // native models[] fallback array. OpenRouter tries each model in order,
 // so the proxy only needs to send one request for intra-provider fallback.
 // The actual model used is returned in the response body "model" field.
+const maxOpenRouterFallbackModels = 3
+
 func BuildOpenRouterRequest(req map[string]any, freeModels []string) map[string]any {
 	if len(freeModels) == 0 {
 		return req
 	}
+	if len(freeModels) > maxOpenRouterFallbackModels {
+		freeModels = freeModels[:maxOpenRouterFallbackModels]
+	}
 	body := copyMap(req)
 	body["model"] = freeModels[0]
-	body["models"] = freeModels // OpenRouter tries these in order
-	delete(body, "stream")      // non-streaming so fallback chain can parse the JSON response
+	body["models"] = append([]string(nil), freeModels...) // OpenRouter tries these in order
+	delete(body, "stream")                                // non-streaming so fallback chain can parse the JSON response
 	return body
 }
 
@@ -36,8 +41,8 @@ func BuildOpenRouterRequest(req map[string]any, freeModels []string) map[string]
 func OpenRouterFreeRouterRequest(req map[string]any) map[string]any {
 	body := copyMap(req)
 	body["model"] = "openrouter/free"
-	delete(body, "models")  // clear any previous models[] array
-	delete(body, "stream")  // non-streaming for consistent JSON response
+	delete(body, "models") // clear any previous models[] array
+	delete(body, "stream") // non-streaming for consistent JSON response
 	return body
 }
 

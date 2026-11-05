@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -57,6 +58,7 @@ func main() {
 // updateCmd scans all enabled providers and writes catalog.json.
 func updateCmd() *cobra.Command {
 	var keepUnscanned, allProviders bool
+	var workers int
 	cmd := &cobra.Command{
 		Use:   "update",
 		Short: "Scan all enabled providers and update catalog.json",
@@ -69,7 +71,7 @@ func updateCmd() *cobra.Command {
 			// Load existing catalog to preserve blocklist across scans.
 			existing, _ := catalog.Load(cfg.Catalog.Path)
 
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			ctx, cancel := context.WithTimeout(cmd.Context(), 2*time.Minute)
 			defer cancel()
 
 			providers := cfg.Providers
@@ -78,11 +80,11 @@ func updateCmd() *cobra.Command {
 				providers = make([]config.ProviderConfig, len(cfg.Providers))
 				copy(providers, cfg.Providers)
 				for i := range providers {
-					providers[i].Enabled = true
+					providers[i].ForceEnabled = true
 				}
 			}
 
-			dispatcher := scan.NewDispatcher()
+			dispatcher := scan.NewDispatcherWithWorkers(workers)
 			cat, err := dispatcher.ScanAll(ctx, providers)
 			if err != nil {
 				return fmt.Errorf("scanning providers: %w", err)
@@ -99,6 +101,9 @@ func updateCmd() *cobra.Command {
 					log.Printf("scan: no results from %v — kept their previous entries", kept)
 				}
 			}
+			// Carry-forward must never resurrect a model excluded by a previous
+			// definitive 402/404 response.
+			cat.FilterBlocklisted()
 
 			// Correlate cross-provider families
 			correlated := scan.Correlate(cat.Entries)
@@ -118,17 +123,17 @@ func updateCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&keepUnscanned, "keep-unscanned", false,
 		"keep previous entries for providers that returned nothing (missing key, outage)")
 	cmd.Flags().BoolVar(&allProviders, "all-providers", false,
-		"also scan providers disabled in the config (some catalogs need no API key)")
+		"also scan providers disabled by missing .env keys or local-provider toggles")
+	cmd.Flags().IntVar(&workers, "workers", 8, "number of provider scans to run concurrently")
 	return cmd
 }
 
 // probeCmd probes models that need reverification.
 func probeCmd() *cobra.Command {
-	var hubURL string
-	var noHub bool
+	var workers int
 	cmd := &cobra.Command{
 		Use:   "probe",
-		Short: "Probe models flagged as needing reverification",
+		Short: "Probe all models flagged as needing reverification",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig()
 			if err != nil {
@@ -145,72 +150,88 @@ func probeCmd() *cobra.Command {
 				return nil
 			}
 
-			// Restrict probing to models the hub lists as free per provider.
-			if !noHub {
-				hctx, hcancel := context.WithTimeout(context.Background(), 30*time.Second)
-				hub, herr := scan.FetchHub(hctx, &http.Client{Timeout: 30 * time.Second}, hubURL)
-				hcancel()
-				if herr != nil {
-					log.Printf("probe: hub list unavailable (%v) — probing all pending models", herr)
-				} else {
-					byID := make(map[string]config.ProviderConfig, len(cfg.Providers))
-					for _, p := range cfg.Providers {
-						byID[p.ID] = p
-					}
-					var filtered []catalog.CatalogEntry
-					for _, e := range pending {
-						p, ok := byID[e.ProviderID]
-						if !ok {
-							continue
-						}
-						if allowed, known := hub.Allows(p, e.ModelID); allowed {
-							filtered = append(filtered, e)
-						} else if known {
-							log.Printf("probe: %s/%s not in hub free list — skipping", e.ProviderID, e.ModelID)
-						}
-					}
-					pending = filtered
-					if len(pending) == 0 {
-						log.Printf("probe: no pending models are on the hub free list")
-						return nil
-					}
-				}
-			}
-			log.Printf("probe: checking %d models...", len(pending))
+			log.Printf("probe: checking all %d pending models with up to %d workers...", len(pending), workers)
 
 			prober := &scan.Prober{Client: &http.Client{Timeout: 20 * time.Second}}
-			ctx := context.Background()
-			updated := 0
-			for _, e := range pending {
-				// Find provider config
-				var provCfg *config.ProviderConfig
-				for i := range cfg.Providers {
-					if cfg.Providers[i].ID == e.ProviderID {
-						provCfg = &cfg.Providers[i]
-						break
+			providerByID := make(map[string]config.ProviderConfig, len(cfg.Providers))
+			for _, provider := range cfg.Providers {
+				providerByID[provider.ID] = provider
+			}
+			type probeJob struct {
+				entry    catalog.CatalogEntry
+				provider config.ProviderConfig
+			}
+			type probeResult struct {
+				entry  catalog.CatalogEntry
+				result scan.ProbeResult
+			}
+			jobs := make(chan probeJob)
+			results := make(chan probeResult, len(pending))
+			workerCount := workers
+			if workerCount < 1 {
+				workerCount = 1
+			}
+			if workerCount > len(pending) {
+				workerCount = len(pending)
+			}
+			ctx := cmd.Context()
+			var wg sync.WaitGroup
+			for i := 0; i < workerCount; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for job := range jobs {
+						results <- probeResult{entry: job.entry, result: prober.Probe(ctx, job.entry, job.provider)}
+					}
+				}()
+			}
+			go func() {
+				defer close(jobs)
+				for _, entry := range pending {
+					provider, ok := providerByID[entry.ProviderID]
+					if !ok || !provider.IsEnabled() {
+						continue
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case jobs <- probeJob{entry: entry, provider: provider}:
 					}
 				}
-				if provCfg == nil {
-					continue
-				}
-				result := prober.Probe(ctx, e, *provCfg)
-				entry := cat.Find(e.ProviderID, e.ModelID)
-				if entry == nil {
-					continue
-				}
+			}()
+			go func() {
+				wg.Wait()
+				close(results)
+			}()
+
+			updated := 0
+			for item := range results {
+				result := item.result
 				if result.IsAccessible {
-					entry.NeedsReverification = false
-					entry.LastVerifiedAt = time.Now()
-					log.Printf("probe: %s/%s ✓ still free", e.ProviderID, e.ModelID)
-				} else if result.StatusCode == 402 || result.StatusCode == 403 {
-					entry.IsFree = false
-					log.Printf("probe: %s/%s ✗ no longer free (status %d)", e.ProviderID, e.ModelID, result.StatusCode)
+					cat.RecordProbeResult(item.entry.ProviderID, item.entry.ModelID, true, result.StatusCode, time.Now())
+					log.Printf("probe: %s/%s ✓ still free", item.entry.ProviderID, item.entry.ModelID)
+					updated++
+				} else if result.StatusCode == http.StatusPaymentRequired || result.StatusCode == http.StatusNotFound {
+					cat.ExcludeModel(item.entry.ProviderID, item.entry.ModelID)
+					log.Printf("probe: %s/%s ✗ excluded from catalog (status %d)", item.entry.ProviderID, item.entry.ModelID, result.StatusCode)
+					updated++
 				} else {
-					log.Printf("probe: %s/%s ? status %d (keeping as free)", e.ProviderID, e.ModelID, result.StatusCode)
+					message := result.ErrMsg
+					if len(message) > 160 {
+						message = message[:160] + "…"
+					}
+					log.Printf("probe: %s/%s ? status %d (keeping as free)%s", item.entry.ProviderID, item.entry.ModelID, result.StatusCode, func() string {
+						if message == "" {
+							return ""
+						}
+						return ": " + message
+					}())
 				}
-				updated++
 			}
 
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			if err := catalog.Save(cat, cfg.Catalog.Path); err != nil {
 				return fmt.Errorf("saving catalog: %w", err)
 			}
@@ -218,10 +239,7 @@ func probeCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&hubURL, "hub-url", scan.DefaultHubURL,
-		"providers.json listing free models per provider")
-	cmd.Flags().BoolVar(&noHub, "no-hub", false,
-		"probe all models flagged for reverification, ignoring the hub list")
+	cmd.Flags().IntVar(&workers, "workers", 12, "number of concurrent model probes")
 	return cmd
 }
 

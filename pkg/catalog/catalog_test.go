@@ -78,3 +78,24 @@ func TestFormatContext(t *testing.T) {
 		}
 	}
 }
+
+func TestExcludeModelRemovesModelFromFreeCatalogAndPersistsBlocklist(t *testing.T) {
+	c := &Catalog{Entries: []CatalogEntry{{ProviderID: "openrouter", ModelID: "vendor/model", IsFree: true}}}
+	if !c.ExcludeModel("openrouter", "vendor/model") {
+		t.Fatal("ExcludeModel returned false for an existing model")
+	}
+	if got := c.FreeEntries(); len(got) != 0 {
+		t.Fatalf("free entries = %v, want model excluded", got)
+	}
+	if len(c.Entries) != 0 {
+		t.Fatalf("catalog entries = %v, want the excluded model removed entirely", c.Entries)
+	}
+	if len(c.Blocklist) != 1 || c.Blocklist[0] != "openrouter/vendor/model" {
+		t.Fatalf("blocklist = %v, want [openrouter/vendor/model]", c.Blocklist)
+	}
+	c.Entries = append(c.Entries, CatalogEntry{ProviderID: "openrouter", ModelID: "vendor/model", IsFree: true})
+	c.FilterBlocklisted()
+	if got := c.FreeEntries(); len(got) != 0 {
+		t.Fatalf("blocked model reappeared after filtering: %v", got)
+	}
+}

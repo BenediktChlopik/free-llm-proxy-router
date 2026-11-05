@@ -45,7 +45,7 @@ func newTestChain(serverURL, providerID, modelID string) (*FallbackChain, *ratel
 	rel := reliability.New()
 	cfg := &config.Config{
 		Providers: []config.ProviderConfig{
-			{ID: providerID, BaseURL: serverURL, Enabled: true},
+			{ID: providerID, BaseURL: serverURL},
 		},
 		Fallback: config.FallbackConfig{MaxAttempts: 3},
 	}
@@ -60,13 +60,80 @@ func newTestChain(serverURL, providerID, modelID string) (*FallbackChain, *ratel
 	return fc, rl, cat
 }
 
-func TestFallbackChain_404TriggersCooldown(t *testing.T) {
+// parallelListStrategy gives the parallel execution path a deterministic
+// candidate order without involving provider scoring.
+type parallelListStrategy []strategy.RankedEntry
+
+func (l parallelListStrategy) Name() string { return "parallel" }
+func (l parallelListStrategy) Rank(_ strategy.Request, _ []catalog.CatalogEntry, _ *models.EnrichedCatalog) []strategy.RankedEntry {
+	return l
+}
+
+func TestParallelStrategyReturnsFirstHealthyProvider(t *testing.T) {
+	var started atomic.Int32
+	bothStarted := make(chan struct{})
+	markStarted := func() {
+		if started.Add(1) == 2 {
+			close(bothStarted)
+		}
+	}
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		markStarted()
+		<-r.Context().Done()
+	}))
+	defer slow.Close()
+	fast := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		markStarted()
+		select {
+		case <-bothStarted:
+			_, _ = w.Write([]byte(`{"model":"fast-model","choices":[{"message":{"content":"fast"}}]}`))
+		case <-r.Context().Done():
+		}
+	}))
+	defer fast.Close()
+
+	cat := &catalog.Catalog{Entries: []catalog.CatalogEntry{
+		{ProviderID: "slow-provider", ModelID: "slow-model", IsFree: true},
+		{ProviderID: "fast-provider", ModelID: "fast-model", IsFree: true},
+	}}
+	fc := &FallbackChain{
+		Cfg: &config.Config{
+			Providers: []config.ProviderConfig{
+				{ID: "slow-provider", BaseURL: slow.URL},
+				{ID: "fast-provider", BaseURL: fast.URL},
+			},
+			Fallback: config.FallbackConfig{MaxAttempts: 2},
+		},
+		Strategy: parallelListStrategy{
+			{ProviderID: "slow-provider", ModelID: "slow-model"},
+			{ProviderID: "fast-provider", ModelID: "fast-model"},
+		},
+		Catalog:            cat,
+		RateLimiter:        ratelimit.NewGlobalTracker(),
+		ReliabilityTracker: reliability.New(),
+		HTTPClient:         &http.Client{Timeout: 2 * time.Second},
+	}
+
+	start := time.Now()
+	resp, err := fc.executePass(context.Background(), Request{Raw: map[string]any{"messages": []any{}}, Messages: []map[string]any{{"role": "user", "content": "hi"}}}, nil)
+	if err != nil {
+		t.Fatalf("parallel pass failed: %v", err)
+	}
+	if resp == nil || !strings.Contains(string(resp.Body), "fast") {
+		t.Fatalf("response = %v, want fast provider completion", resp)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("parallel pass took %s; it did not return promptly", elapsed)
+	}
+}
+
+func TestFallbackChain_404ExcludesModel(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"model not found"}}`, http.StatusNotFound)
 	}))
 	defer srv.Close()
 
-	fc, rl, _ := newTestChain(srv.URL, "testprovider", "test-model")
+	fc, rl, cat := newTestChain(srv.URL, "testprovider", "test-model")
 	req := Request{
 		Model:    "test-model",
 		Messages: []map[string]any{{"role": "user", "content": "hi"}},
@@ -74,8 +141,11 @@ func TestFallbackChain_404TriggersCooldown(t *testing.T) {
 
 	_, _ = fc.executePass(context.Background(), req, nil)
 
-	if !rl.IsOnCooldown("testprovider/test-model") {
-		t.Error("expected test-model to be on cooldown after 404")
+	if got := cat.FreeEntries(); len(got) != 0 {
+		t.Errorf("404 model remains routable: %v", got)
+	}
+	if len(cat.Blocklist) != 1 || cat.Blocklist[0] != "testprovider/test-model" {
+		t.Errorf("404 model was not persisted to blocklist: %v", cat.Blocklist)
 	}
 	if rl.IsOnCooldown("testprovider") {
 		t.Error("a 404 for one model must not put the whole provider on cooldown")
@@ -101,9 +171,9 @@ func TestFallbackChain_401TriggersCooldown(t *testing.T) {
 	}
 }
 
-func TestFallbackChain_404MarksNeedsReverification(t *testing.T) {
+func TestFallbackChain_402ExcludesModel(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, `{"error":{"message":"model not found"}}`, http.StatusNotFound)
+		http.Error(w, `{"error":{"message":"payment required"}}`, http.StatusPaymentRequired)
 	}))
 	defer srv.Close()
 
@@ -115,14 +185,13 @@ func TestFallbackChain_404MarksNeedsReverification(t *testing.T) {
 
 	_, _ = fc.executePass(context.Background(), req, nil)
 
-	entry := cat.Find("testprovider", "test-model")
-	if entry == nil || !entry.NeedsReverification {
-		t.Error("expected test-model to be flagged NeedsReverification after 404")
+	if got := cat.FreeEntries(); len(got) != 0 {
+		t.Errorf("402 model remains routable: %v", got)
 	}
 }
 
 func TestBuildBodyServiceTierOnlyWhenConfigured(t *testing.T) {
-	cfg := &config.Config{Providers: []config.ProviderConfig{{ID: "groq", Enabled: true}}}
+	cfg := &config.Config{Providers: []config.ProviderConfig{{ID: "groq"}}}
 	fc := &FallbackChain{Cfg: cfg}
 	raw := map[string]any{"model": "auto", "stream": true}
 
@@ -464,9 +533,9 @@ func TestExecute_EveryPassSendsTheOriginalRequest(t *testing.T) {
 func TestRetryDelay_BoundedAndCooldownAware(t *testing.T) {
 	fc := &FallbackChain{RateLimiter: ratelimit.NewGlobalTracker()}
 	for i := 0; i < 50; i++ {
-		d := fc.retryDelay(time.Second)
-		if d < 800*time.Millisecond || d > 1200*time.Millisecond {
-			t.Fatalf("delay %v outside ±20%% of the 1s backoff", d)
+		d := fc.retryDelay(250 * time.Millisecond)
+		if d < 200*time.Millisecond || d > 300*time.Millisecond {
+			t.Fatalf("delay %v outside ±20%% of the 250ms backoff", d)
 		}
 	}
 	fc.RateLimiter.SetCooldown("p/m", time.Now().Add(300*time.Millisecond))
@@ -537,7 +606,7 @@ func TestIsEmptyCompletion(t *testing.T) {
 // twoProviderChain wires providers "aaa" and "bbb" to separate test servers.
 func twoProviderChain(urlA, urlB string) *FallbackChain {
 	fc, _, _ := newTestChain(urlA, "aaa", "m")
-	fc.Cfg.Providers = append(fc.Cfg.Providers, config.ProviderConfig{ID: "bbb", BaseURL: urlB, Enabled: true})
+	fc.Cfg.Providers = append(fc.Cfg.Providers, config.ProviderConfig{ID: "bbb", BaseURL: urlB})
 	fc.Strategy = listStrategy{{ProviderID: "aaa", ModelID: "m"}, {ProviderID: "bbb", ModelID: "m"}}
 	fastBackoff(fc)
 	return fc

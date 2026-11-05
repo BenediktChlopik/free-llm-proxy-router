@@ -77,7 +77,14 @@ cp .env.example .env
 # Edit .env and fill in your keys
 ```
 
-At minimum you need one key. Easiest to get (no credit card):
+Most hosted providers need an API key; keyless endpoints have explicit `.env` toggles.
+Provider YAML blocks no longer have an `enabled` flag. A provider with `api_key_env`
+is automatically enabled when that variable has a non-empty
+value in `.env` (or the process environment). Local inference servers and keyless
+providers are opt-in through their `*_ENABLED=true` toggles in `.env.example`. Editing
+`.env` while the proxy is running reloads provider availability automatically.
+
+Easiest keys to get (no credit card):
 
 | Provider | Sign up | Free tier |
 |----------|---------|-----------|
@@ -129,23 +136,28 @@ Pass any strategy name as the `model` field, or set a default in `config.yaml`:
 | `tools` | Tool/function-calling models only (non-tool models are excluded, not just demoted) |
 | `long_context` | Highest context window first (Gemini 1M) |
 | `similar` | Same model family as a reference model |
-| `parallel` | Returns N models for fan-out requests |
+| `parallel` | Sends requests to up to `fan_out` providers concurrently; first usable answer wins |
 | `reliable` | Highest success-rate providers first |
 | `economical` | Rate-limited free tiers before credit-based |
 
 ## Fallback chain
 
-Every request runs through a 5-step fallback:
+The standard fallback strategy uses this five-step order:
 
-1. **OpenRouter** with `models[]` array — native multi-model fallback in one request
+1. **OpenRouter** with at most three `models[]` — native multi-model fallback in one request
 2. **Groq** — fast inference, free tier, per-model RPM/RPD limits
 3. **Gemini** (4-dimensional rate limit check: RPM/TPM/RPD/IPM)
 4. **Remaining ranked providers** (by strategy)
 5. **OpenRouter `openrouter/free`** — ultimate fallback router
 
-Rate-limited providers (429) are put on a cooldown automatically and skipped until the window resets.
+The `parallel` strategy instead sends requests concurrently to its top-ranked eligible providers and returns the first usable response.
 
-**The request stays pending until a real provider answers.** `fallback.max_attempts` caps the provider calls in one pass over the chain; if a pass finds no working provider, the proxy waits (exponential backoff `retry_backoff_initial` → `retry_backoff_max`, with jitter, cut short when a cooldown expires) and starts another pass with the original request. The client only ever receives a genuine provider completion — never a synthetic one. A `200` response with no content (no text, tool calls or choices, or a non-JSON body) counts as a failed attempt: the proxy tries all other providers first and only asks the provider that returned the empty answer again after them. Streaming clients get SSE `: keep-alive` comments while waiting. To bound the wait, set `fallback.max_wait`; when it elapses the proxy returns HTTP 503 with an OpenAI-style `error` object (not a completion). A client that disconnects cancels the retries.
+Rate-limited providers (429) are put on a cooldown automatically and skipped until the window resets.
+Definitive HTTP 402 and 404 model failures remove that model from the live and persisted catalog,
+and the blocklist prevents later scans from reintroducing it. Provider scans and probe checks
+run concurrently with bounded worker pools.
+
+**The request stays pending until a real provider answers.** `fallback.max_attempts` caps the provider calls in one pass over the chain; if a pass finds no working provider, the proxy waits (exponential backoff starting at 250ms by default (`retry_backoff_initial` → `retry_backoff_max`), with jitter, cut short when a cooldown expires) and starts another pass with the original request. The client only ever receives a genuine provider completion — never a synthetic one. A `200` response with no content (no text, tool calls or choices, or a non-JSON body) counts as a failed attempt: the proxy tries all other providers first and only asks the provider that returned the empty answer again after them. Streaming clients get SSE `: keep-alive` comments while waiting. To bound the wait, set `fallback.max_wait`; when it elapses the proxy returns HTTP 503 with an OpenAI-style `error` object (not a completion). A client that disconnects cancels the retries.
 
 ## Supported providers
 
@@ -190,11 +202,8 @@ catalog:
 # Scan all providers for free models
 ./bin/free-llm-scan update
 
-# Probe models flagged as needing reverification (got a 429)
+# Probe all models flagged as needing reverification (no external model list required)
 ./bin/free-llm-scan probe
-# Only models listed as free in https://freellmapihub.com/providers.json are probed
-# (providers the hub doesn't enumerate are probed as before); use --no-hub to disable.
-# Set `hub_slug:` on a provider if its slug there differs from its id.
 
 # LLM-powered diff refresh (checks for free tier changes)
 ./bin/free-llm-scan refresh-llm
