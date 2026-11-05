@@ -46,4 +46,8 @@ type ModelFamily struct {
 type KnownCapabilityPattern struct {
 	Capability Capability `yaml:"capability"`
 	Keywords   []string   `yaml:"keywords"`
+	// Exclude vetoes the capability when the model ID contains any of these
+	// substrings, even if a keyword matched (e.g. distilled R1 models never
+	// support function calling).
+	Exclude []string `yaml:"exclude,omitempty"`
 }

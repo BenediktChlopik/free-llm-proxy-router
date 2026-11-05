@@ -13,7 +13,8 @@ import (
 func testEntries() []catalog.CatalogEntry {
 	return []catalog.CatalogEntry{
 		{ProviderID: "groq", ModelID: "llama-3.1-8b-instant", IsFree: true, ContextWindow: 131072},
-		{ProviderID: "groq", ModelID: "llama-3.3-70b-versatile", IsFree: true, ContextWindow: 131072},
+		{ProviderID: "groq", ModelID: "llama-3.3-70b-versatile", IsFree: true, ContextWindow: 131072,
+			Metadata: map[string]any{"supports_tools": true}},
 		{ProviderID: "groq", ModelID: "mixtral-8x7b-32768", IsFree: true, ContextWindow: 32768},
 		{ProviderID: "cerebras", ModelID: "llama3.1-8b", IsFree: true},
 		{ProviderID: "cerebras", ModelID: "llama3.1-70b", IsFree: true},
@@ -325,4 +326,24 @@ func containsAny(s string, substrs ...string) bool {
 		}
 	}
 	return false
+}
+
+func TestStrategyTools(t *testing.T) {
+	entries := []catalog.CatalogEntry{
+		{ProviderID: "openrouter", ModelID: "a/no-tools:free", IsFree: true, Metadata: map[string]any{"supports_tools": false}},
+		{ProviderID: "openrouter", ModelID: "b/big-70b:free", IsFree: true, Metadata: map[string]any{"supports_tools": true}},
+		{ProviderID: "groq", ModelID: "unknown-model-8b", IsFree: true},
+		{ProviderID: "groq", ModelID: "paid-70b", IsFree: false, Metadata: map[string]any{"supports_tools": true}},
+		{ProviderID: "groq", ModelID: "tiny-1b", IsFree: true, Metadata: map[string]any{"supports_tools": true}},
+	}
+	ranked := (&StrategyTools{}).Rank(testReq(), entries, nil)
+	if len(ranked) != 2 {
+		t.Fatalf("got %d entries, want 2: %+v", len(ranked), ranked)
+	}
+	if ranked[0].ModelID != "b/big-70b:free" {
+		t.Errorf("top = %s, want b/big-70b:free", ranked[0].ModelID)
+	}
+	if ranked[1].ModelID != "tiny-1b" {
+		t.Errorf("second = %s, want tiny-1b", ranked[1].ModelID)
+	}
 }

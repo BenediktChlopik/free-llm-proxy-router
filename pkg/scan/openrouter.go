@@ -34,7 +34,10 @@ type OpenRouterScanner struct {
 type orModel struct {
 	ID      string `json:"id"`
 	Context int    `json:"context_length"`
-	Pricing struct {
+	// SupportedParameters lists request parameters the model accepts; "tools"
+	// means it supports tool/function calling.
+	SupportedParameters []string `json:"supported_parameters"`
+	Pricing             struct {
 		Prompt     string `json:"prompt"`
 		Completion string `json:"completion"`
 	} `json:"pricing"`
@@ -91,7 +94,7 @@ func (s *OpenRouterScanner) ScanFreeModels(ctx context.Context, cfg config.Provi
 			continue
 		}
 
-		entries = append(entries, catalog.CatalogEntry{
+		entry := catalog.CatalogEntry{
 			ProviderID:     cfg.ID,
 			ModelID:        m.ID,
 			IsFree:         true,
@@ -99,7 +102,20 @@ func (s *OpenRouterScanner) ScanFreeModels(ctx context.Context, cfg config.Provi
 			ContextWindow:  m.Context,
 			DiscoveredAt:   time.Now(),
 			LastVerifiedAt: time.Now(),
-		})
+		}
+		if len(m.SupportedParameters) > 0 {
+			entry.Metadata = map[string]any{"supports_tools": hasParam(m.SupportedParameters, "tools")}
+		}
+		entries = append(entries, entry)
 	}
 	return entries, nil
+}
+
+func hasParam(params []string, want string) bool {
+	for _, p := range params {
+		if p == want {
+			return true
+		}
+	}
+	return false
 }

@@ -16,5 +16,14 @@
 - capability: json_mode
   keywords: ["json", "structured-output"]
 
+# Name heuristics for tool/function calling, used by the "tools" strategy when the
+# provider's model list does not say (OpenRouter's does and takes precedence).
+# Matched as lowercase substrings; "exclude" vetoes a match.
 - capability: function_calling
-  keywords: ["tools", "function-calling", "tool-use", "function_calling"]
+  keywords: ["tools", "function-calling", "tool-use", "function_calling",
+             "gpt-oss", "llama-3.1", "llama-3.3", "llama-4", "llama3.1", "llama3.3",
+             "qwen3", "qwen2.5", "gemini", "mistral-large", "mistral-small", "mistral-medium",
+             "magistral", "devstral", "ministral", "codestral", "mixtral", "mistral-nemo",
+             "command-r", "command-a", "deepseek-v3", "deepseek-chat", "kimi", "glm-4", "glm-5",
+             "minimax", "hermes-3", "hermes-4", "granite", "nemotron", "gpt-4", "gpt-5", "grok"]
+  exclude: ["distill", "deepseek-r1", "vision", "-base", "guard", "embed", "tts", "whisper"]

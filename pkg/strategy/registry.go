@@ -12,7 +12,7 @@ type Registry struct {
 	strategies map[string]Strategy
 }
 
-// NewRegistry creates a Registry with all 13 strategies pre-registered.
+// NewRegistry creates a Registry with all 14 strategies pre-registered.
 // Pass the dependency objects needed by stateful strategies.
 func NewRegistry(
 	reliabilityTracker *reliability.Tracker,
@@ -32,6 +32,7 @@ func NewRegistry(
 		&StrategySmall{GlobalTracker: globalRateTracker},
 		&StrategyTiny{},
 		&StrategyCoding{},
+		&StrategyTools{},
 		&StrategyLongContext{},
 		&StrategySimilar{TargetFamily: similarFamily},
 		&StrategyParallel{FanOut: parallelFanOut},

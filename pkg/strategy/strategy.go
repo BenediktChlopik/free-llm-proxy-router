@@ -1,4 +1,4 @@
-// Package strategy implements the 13 model-selection strategies.
+// Package strategy implements the 14 model-selection strategies.
 package strategy
 
 import (
@@ -28,7 +28,7 @@ type RankedEntry struct {
 	ModelID  string
 }
 
-// Strategy is the interface implemented by all 13 strategies.
+// Strategy is the interface implemented by all 14 strategies.
 type Strategy interface {
 	// Name returns the strategy identifier used in config.
 	Name() string

@@ -32,6 +32,9 @@ func DetectCapabilities(modelID string) []Capability {
 	var caps []Capability
 
 	for _, pattern := range loadedCapabilityPatterns {
+		if containsAny(lower, pattern.Exclude) {
+			continue
+		}
 		for _, kw := range pattern.Keywords {
 			if strings.Contains(lower, strings.ToLower(kw)) {
 				if !seen[pattern.Capability] {
@@ -43,4 +46,13 @@ func DetectCapabilities(modelID string) []Capability {
 		}
 	}
 	return caps
+}
+
+func containsAny(lower string, subs []string) bool {
+	for _, sub := range subs {
+		if sub != "" && strings.Contains(lower, strings.ToLower(sub)) {
+			return true
+		}
+	}
+	return false
 }

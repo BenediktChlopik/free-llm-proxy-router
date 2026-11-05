@@ -126,6 +126,7 @@ Pass any strategy name as the `model` field, or set a default in `config.yaml`:
 | `small` | 3–13B models — fast and efficient |
 | `tiny` | <3B models — ultra-fast, low latency |
 | `coding` | Prefers models with code capability |
+| `tools` | Tool/function-calling models only (non-tool models are excluded, not just demoted) |
 | `long_context` | Highest context window first (Gemini 1M) |
 | `similar` | Same model family as a reference model |
 | `parallel` | Returns N models for fan-out requests |
@@ -191,6 +192,9 @@ catalog:
 
 # Probe models flagged as needing reverification (got a 429)
 ./bin/free-llm-scan probe
+# Only models listed as free in https://freellmapihub.com/providers.json are probed
+# (providers the hub doesn't enumerate are probed as before); use --no-hub to disable.
+# Set `hub_slug:` on a provider if its slug there differs from its id.
 
 # LLM-powered diff refresh (checks for free tier changes)
 ./bin/free-llm-scan refresh-llm
@@ -223,7 +227,7 @@ go vet ./...
 make build
 ```
 
-Tests cover: 30+ model name classifier cases, all 10 provider rate-limit header extractors, all 13 strategy `Rank()` methods.
+Tests cover: 30+ model name classifier cases, all 10 provider rate-limit header extractors, all 14 strategy `Rank()` methods.
 
 ## Acknowledgments
 

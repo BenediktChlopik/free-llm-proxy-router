@@ -124,7 +124,9 @@ func updateCmd() *cobra.Command {
 
 // probeCmd probes models that need reverification.
 func probeCmd() *cobra.Command {
-	return &cobra.Command{
+	var hubURL string
+	var noHub bool
+	cmd := &cobra.Command{
 		Use:   "probe",
 		Short: "Probe models flagged as needing reverification",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -141,6 +143,38 @@ func probeCmd() *cobra.Command {
 			if len(pending) == 0 {
 				log.Printf("probe: no models need reverification")
 				return nil
+			}
+
+			// Restrict probing to models the hub lists as free per provider.
+			if !noHub {
+				hctx, hcancel := context.WithTimeout(context.Background(), 30*time.Second)
+				hub, herr := scan.FetchHub(hctx, &http.Client{Timeout: 30 * time.Second}, hubURL)
+				hcancel()
+				if herr != nil {
+					log.Printf("probe: hub list unavailable (%v) — probing all pending models", herr)
+				} else {
+					byID := make(map[string]config.ProviderConfig, len(cfg.Providers))
+					for _, p := range cfg.Providers {
+						byID[p.ID] = p
+					}
+					var filtered []catalog.CatalogEntry
+					for _, e := range pending {
+						p, ok := byID[e.ProviderID]
+						if !ok {
+							continue
+						}
+						if allowed, known := hub.Allows(p, e.ModelID); allowed {
+							filtered = append(filtered, e)
+						} else if known {
+							log.Printf("probe: %s/%s not in hub free list — skipping", e.ProviderID, e.ModelID)
+						}
+					}
+					pending = filtered
+					if len(pending) == 0 {
+						log.Printf("probe: no pending models are on the hub free list")
+						return nil
+					}
+				}
 			}
 			log.Printf("probe: checking %d models...", len(pending))
 
@@ -184,6 +218,11 @@ func probeCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&hubURL, "hub-url", scan.DefaultHubURL,
+		"providers.json listing free models per provider")
+	cmd.Flags().BoolVar(&noHub, "no-hub", false,
+		"probe all models flagged for reverification, ignoring the hub list")
+	return cmd
 }
 
 // refreshLLMCmd uses an LLM to diff the catalog against live provider info.

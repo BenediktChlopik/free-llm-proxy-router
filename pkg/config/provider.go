@@ -34,6 +34,10 @@ type ProviderConfig struct {
 	// Discovery configures how free models are enumerated.
 	Discovery DiscoveryConfig `mapstructure:"discovery"`
 
+	// HubSlug is the provider's slug on freellmapihub.com/providers.json when it
+	// differs from ID (e.g. id "gemini" -> slug "google-gemini"). Optional.
+	HubSlug string `mapstructure:"hub_slug"`
+
 	// PreferredVolumeModel is used by StrategyVolume to pick highest-RPD model.
 	PreferredVolumeModel string `mapstructure:"preferred_volume_model"`
 }
