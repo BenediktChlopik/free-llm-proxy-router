@@ -168,7 +168,7 @@ func (r *Runner) benchOne(ctx context.Context, cfg config.ProviderConfig, modelI
 
 func (r *Runner) findProvider(id string) *config.ProviderConfig {
 	for i := range r.Cfg.Providers {
-		if r.Cfg.Providers[i].ID == id && r.Cfg.Providers[i].Enabled {
+		if r.Cfg.Providers[i].ID == id && r.Cfg.Providers[i].IsEnabled() {
 			return &r.Cfg.Providers[i]
 		}
 	}

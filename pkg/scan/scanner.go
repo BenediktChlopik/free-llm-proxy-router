@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/catalog"
@@ -19,43 +20,112 @@ type ProviderScanner interface {
 
 // Dispatcher selects the correct ProviderScanner for each provider.
 type Dispatcher struct {
-	client *http.Client
+	client  *http.Client
+	workers int
 }
 
 // NewDispatcher creates a Dispatcher with a default HTTP client.
 func NewDispatcher() *Dispatcher {
+	return NewDispatcherWithWorkers(8)
+}
+
+// NewDispatcherWithWorkers creates a dispatcher with a bounded number of
+// provider scans running concurrently. A zero or negative value uses 8 workers.
+func NewDispatcherWithWorkers(workers int) *Dispatcher {
+	if workers <= 0 {
+		workers = 8
+	}
 	return &Dispatcher{
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		client:  &http.Client{Timeout: 30 * time.Second},
+		workers: workers,
 	}
 }
 
 // ScanAll runs all enabled provider scanners and merges the results.
 func (d *Dispatcher) ScanAll(ctx context.Context, providers []config.ProviderConfig) (*catalog.Catalog, error) {
-	cat := &catalog.Catalog{
-		Version:   1,
-		UpdatedAt: time.Now(),
+	type scanJob struct {
+		index    int
+		provider config.ProviderConfig
+	}
+	type scanResult struct {
+		index      int
+		providerID string
+		entries    []catalog.CatalogEntry
+		err        error
 	}
 
-	for _, p := range providers {
-		if !p.Enabled {
-			continue
-		}
-		scanner := d.scannerFor(p.ID)
-		if scanner == nil {
-			log.Printf("scan: no scanner registered for provider %q — skipping", p.ID)
-			continue
-		}
+	cat := &catalog.Catalog{Version: 1, UpdatedAt: time.Now()}
+	jobs := make(chan scanJob)
+	results := make(chan scanResult, len(providers))
+	workers := d.workers
+	if workers <= 0 {
+		workers = 8
+	}
+	if workers > len(providers) {
+		workers = len(providers)
+	}
+	if workers == 0 {
+		return cat, nil
+	}
 
-		log.Printf("scan: scanning provider %s ...", p.ID)
-		entries, err := scanner.ScanFreeModels(ctx, p)
-		if err != nil {
-			log.Printf("scan: %s error: %v — continuing", p.ID, err)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				if err := ctx.Err(); err != nil {
+					results <- scanResult{index: job.index, providerID: job.provider.ID, err: err}
+					continue
+				}
+				if !job.provider.IsEnabled() {
+					continue
+				}
+				scanner := d.scannerFor(job.provider.ID)
+				if scanner == nil {
+					log.Printf("scan: no scanner registered for provider %q — skipping", job.provider.ID)
+					continue
+				}
+				log.Printf("scan: scanning provider %s ...", job.provider.ID)
+				entries, err := scanner.ScanFreeModels(ctx, job.provider)
+				results <- scanResult{index: job.index, providerID: job.provider.ID, entries: entries, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for i, provider := range providers {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- scanJob{index: i, provider: provider}:
+			}
+		}
+	}()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Store results by config index so concurrent completion does not make the
+	// catalog order nondeterministic between runs.
+	ordered := make([][]catalog.CatalogEntry, len(providers))
+	for result := range results {
+		if result.err != nil {
+			if result.err != context.Canceled && result.err != context.DeadlineExceeded {
+				log.Printf("scan: %s error: %v — continuing", result.providerID, result.err)
+			}
 			continue
 		}
+		ordered[result.index] = result.entries
+		log.Printf("scan: %s → %d entries", result.providerID, len(result.entries))
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for _, entries := range ordered {
 		cat.Entries = append(cat.Entries, entries...)
-		log.Printf("scan: %s → %d entries", p.ID, len(entries))
 	}
 	return cat, nil
 }

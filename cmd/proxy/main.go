@@ -24,8 +24,8 @@ import (
 )
 
 var (
-	cfgFile  string
-	port     int
+	cfgFile   string
+	port      int
 	stratName string
 )
 
@@ -69,20 +69,25 @@ func runProxy(cmd *cobra.Command, args []string) error {
 		log.Printf("warning: catalog is empty — run 'free-llm-scan update' to discover free models")
 	}
 
-	var ready, noKey []string
+	var ready, noKey, disabled []string
 	for i := range cfg.Providers {
 		p := &cfg.Providers[i]
-		switch {
-		case !p.Enabled:
-		case p.MissingKey():
-			noKey = append(noKey, p.ID)
-		default:
+		if p.IsEnabled() {
 			ready = append(ready, p.ID)
+			continue
+		}
+		if p.APIKeyEnv != "" && p.MissingKey() {
+			noKey = append(noKey, p.ID)
+		} else {
+			disabled = append(disabled, p.ID)
 		}
 	}
 	log.Printf("providers ready: %s", strings.Join(ready, ", "))
 	if len(noKey) > 0 {
-		log.Printf("providers skipped (no API key): %s", strings.Join(noKey, ", "))
+		log.Printf("providers skipped (missing .env key): %s", strings.Join(noKey, ", "))
+	}
+	if len(disabled) > 0 {
+		log.Printf("providers disabled by .env toggle: %s", strings.Join(disabled, ", "))
 	}
 	if len(ready) == 0 {
 		log.Printf("warning: no provider has an API key — add one to .env (see .env.example)")

@@ -15,10 +15,10 @@ import (
 
 // Config is the top-level configuration struct.
 type Config struct {
-	Proxy   ProxyConfig    `mapstructure:"proxy"`
-	Catalog CatalogConfig  `mapstructure:"catalog"`
-	Refresh RefreshConfig  `mapstructure:"refresh"`
-	Fallback FallbackConfig `mapstructure:"fallback"`
+	Proxy     ProxyConfig      `mapstructure:"proxy"`
+	Catalog   CatalogConfig    `mapstructure:"catalog"`
+	Refresh   RefreshConfig    `mapstructure:"refresh"`
+	Fallback  FallbackConfig   `mapstructure:"fallback"`
 	Providers []ProviderConfig `mapstructure:"providers"`
 }
 
@@ -69,7 +69,7 @@ type CatalogConfig struct {
 // GitSyncConfig controls catalog synchronisation via git or a raw remote URL.
 // See pkg/catalog/gitsync.go for full documentation.
 type GitSyncConfig struct {
-	Enabled       bool   `mapstructure:"enabled"`
+	Enabled bool `mapstructure:"enabled"`
 	// Scanner role (one machine only):
 	RepoPath      string `mapstructure:"repo_path"`
 	CatalogInRepo string `mapstructure:"catalog_in_repo"`
@@ -82,23 +82,23 @@ type GitSyncConfig struct {
 
 // RefreshConfig holds the LLM-powered refresh settings.
 type RefreshConfig struct {
-	Model      string `mapstructure:"model"`
-	Provider   string `mapstructure:"provider"`
-	Schedule   string `mapstructure:"schedule"`
-	PromptFile string `mapstructure:"prompt_file"`
-	WebSearch  bool   `mapstructure:"web_search"`
+	Model       string `mapstructure:"model"`
+	Provider    string `mapstructure:"provider"`
+	Schedule    string `mapstructure:"schedule"`
+	PromptFile  string `mapstructure:"prompt_file"`
+	WebSearch   bool   `mapstructure:"web_search"`
 	OutputMerge string `mapstructure:"output_merge"`
 }
 
 // FallbackConfig controls retry and fallback behaviour.
 type FallbackConfig struct {
-	RetryOn429              bool `mapstructure:"retry_on_429"`
-	RetryOn5xx              bool `mapstructure:"retry_on_5xx"`
+	RetryOn429 bool `mapstructure:"retry_on_429"`
+	RetryOn5xx bool `mapstructure:"retry_on_5xx"`
 	// MaxAttempts caps provider calls per pass over the fallback chain. It no
 	// longer ends the request: after a pass fails, the chain backs off and
 	// starts over until a provider answers.
-	MaxAttempts             int  `mapstructure:"max_attempts"`
-	CerebrasRequestSpacingMs int  `mapstructure:"cerebras_request_spacing_ms"`
+	MaxAttempts              int `mapstructure:"max_attempts"`
+	CerebrasRequestSpacingMs int `mapstructure:"cerebras_request_spacing_ms"`
 	// RetryBackoffInitial is the wait after the first failed pass; it doubles
 	// after every further failed pass up to RetryBackoffMax (with jitter).
 	RetryBackoffInitial time.Duration `mapstructure:"retry_backoff_initial"`
@@ -178,43 +178,109 @@ func Watch(path string, onChange func(*Config)) (stop func(), err error) {
 	}
 
 	target := path
+	configDir := ""
 	if target == "" {
-		target = "config.yaml"
+		// Match Load's search order when the CLI uses its default config lookup.
+		// Watching only ./config.yaml misses configs/config.yaml and the user
+		// config under ~/.free-llm-proxy-router/.
+		search := viper.New()
+		search.SetConfigName("config")
+		search.SetConfigType("yaml")
+		search.AddConfigPath(".")
+		search.AddConfigPath(expandHome("~/.free-llm-proxy-router"))
+		search.AddConfigPath("configs")
+		if searchErr := search.ReadInConfig(); searchErr == nil {
+			target = search.ConfigFileUsed()
+		} else {
+			// Also watch the conventional local path so creating config.yaml
+			// after startup can trigger a reload.
+			target = "config.yaml"
+		}
+	} else {
+		configDir = filepath.Dir(target)
 	}
-	if err := watcher.Add(filepath.Dir(target)); err != nil {
+	watchFiles := make(map[string]struct{})
+	watchDirs := make(map[string]struct{})
+	addWatchFile := func(file string, required bool) error {
+		abs, absErr := filepath.Abs(file)
+		if absErr != nil {
+			return absErr
+		}
+		watchFiles[filepath.Clean(abs)] = struct{}{}
+		dir := filepath.Dir(abs)
+		if _, exists := watchDirs[dir]; exists {
+			return nil
+		}
+		if stat, statErr := os.Stat(dir); statErr != nil || !stat.IsDir() {
+			if required {
+				if statErr != nil {
+					return statErr
+				}
+				return fmt.Errorf("%s is not a directory", dir)
+			}
+			return nil
+		}
+		if addErr := watcher.Add(dir); addErr != nil {
+			if required {
+				return addErr
+			}
+			return nil
+		}
+		watchDirs[dir] = struct{}{}
+		return nil
+	}
+	if err := addWatchFile(target, true); err != nil {
 		watcher.Close()
 		return nil, fmt.Errorf("watching %s: %w", target, err)
 	}
+	for _, envFile := range defaultEnvPaths(configDir) {
+		_ = addWatchFile(envFile, false)
+	}
 
 	go func() {
-		debounce := time.NewTimer(0)
-		<-debounce.C // drain initial tick
-
+		var debounce *time.Timer
+		var debounceC <-chan time.Time
 		for {
 			select {
 			case event, ok := <-watcher.Events:
 				if !ok {
 					return
 				}
-				if event.Name != target && filepath.Base(event.Name) != filepath.Base(target) {
+				abs, absErr := filepath.Abs(event.Name)
+				if absErr != nil {
 					continue
 				}
-				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
-					debounce.Reset(200 * time.Millisecond)
+				if _, watched := watchFiles[filepath.Clean(abs)]; !watched {
+					continue
 				}
-			case err, ok := <-watcher.Errors:
+				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) || event.Has(fsnotify.Remove) {
+					if debounce == nil {
+						debounce = time.NewTimer(200 * time.Millisecond)
+						debounceC = debounce.C
+					} else {
+						if !debounce.Stop() {
+							select {
+							case <-debounce.C:
+							default:
+							}
+						}
+						debounce.Reset(200 * time.Millisecond)
+					}
+				}
+			case watchErr, ok := <-watcher.Errors:
 				if !ok {
 					return
 				}
-				log.Printf("config watcher error: %v", err)
-			case <-debounce.C:
-				cfg, err := Load(path)
-				if err != nil {
-					log.Printf("config reload error: %v", err)
-					continue
+				log.Printf("config watcher error: %v", watchErr)
+			case <-debounceC:
+				cfg, loadErr := Load(path)
+				if loadErr != nil {
+					log.Printf("config reload error: %v", loadErr)
+				} else {
+					log.Printf("config reloaded from %s (including .env/.secrets)", path)
+					onChange(cfg)
 				}
-				log.Printf("config reloaded from %s", path)
-				onChange(cfg)
+				debounceC = nil
 			}
 		}
 	}()
@@ -235,7 +301,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("fallback.retry_on_5xx", true)
 	v.SetDefault("fallback.max_attempts", 5)
 	v.SetDefault("fallback.cerebras_request_spacing_ms", 100)
-	v.SetDefault("fallback.retry_backoff_initial", "1s")
+	v.SetDefault("fallback.retry_backoff_initial", "250ms")
 	v.SetDefault("fallback.retry_backoff_max", "30s")
 	v.SetDefault("fallback.max_wait", "0s")
 	v.SetDefault("refresh.schedule", "weekly")

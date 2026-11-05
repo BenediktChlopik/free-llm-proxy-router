@@ -1,15 +1,25 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // ProviderConfig holds all configuration for a single provider.
 type ProviderConfig struct {
 	ID       string `mapstructure:"id"`
 	Name     string `mapstructure:"name"`
 	BaseURL  string `mapstructure:"base_url"`
-	Enabled  bool   `mapstructure:"enabled"`
 	Priority int    `mapstructure:"priority"`
-	Timeout  string `mapstructure:"timeout"`
+
+	// EnableEnv is an optional boolean environment variable for providers that
+	// do not need an API key (for example, local inference servers).
+	EnableEnv string `mapstructure:"enable_env"`
+
+	// ForceEnabled is an internal override used by explicit scan commands. It is
+	// intentionally not decoded from configuration files.
+	ForceEnabled bool   `mapstructure:"-"`
+	Timeout      string `mapstructure:"timeout"`
 
 	// Auth: either api_key_env (env var name) or api_key (literal, use sparingly)
 	APIKeyEnv  string `mapstructure:"api_key_env"`
@@ -47,9 +57,6 @@ type NativeFeatures struct {
 	// ServiceTier is sent as-is in the request body (Groq: "auto").
 	ServiceTier string `mapstructure:"service_tier"`
 
-	// NativeFallbackEnabled: if true, proxy builds models[] array for this provider.
-	NativeFallbackEnabled bool `mapstructure:"enabled"`
-
 	// FreeRouterModel is the model ID for ultimate fallback (OpenRouter: "openrouter/free").
 	FreeRouterModel string `mapstructure:"free_router_model"`
 }
@@ -78,6 +85,31 @@ type DiscoveryConfig struct {
 
 	// HubAPIFilters is passed to the HF Hub API for model filtering.
 	HubAPIFilters string `mapstructure:"hub_api_filters"`
+}
+
+// IsEnabled derives provider availability from the current environment instead
+// of a duplicated YAML boolean. Providers with api_key_env are enabled only
+// when at least one key is present. Providers without an API key requirement
+// are enabled by default unless an explicit EnableEnv toggle is configured.
+func (p *ProviderConfig) IsEnabled() bool {
+	if p == nil {
+		return false
+	}
+	if p.ForceEnabled {
+		return true
+	}
+	if p.EnableEnv != "" {
+		switch strings.ToLower(strings.TrimSpace(lookupEnv(p.EnableEnv))) {
+		case "1", "true", "yes", "on":
+			return true
+		default:
+			return false
+		}
+	}
+	if p.APIKeyEnv != "" {
+		return len(p.AllKeys()) > 0
+	}
+	return true
 }
 
 // ResolvedAPIKey returns the bare API key (no header name, no prefix).

@@ -33,21 +33,22 @@ import (
 //   - HuggingFace 503+loading: wait estimated_time, retry SAME provider
 //   - Cerebras: pre-emptive slowdown if remaining-requests < 2
 type FallbackChain struct {
-	Cfg             *config.Config
-	Strategy        strategy.Strategy
-	Catalog         *catalog.Catalog
-	RateLimiter     *ratelimit.GlobalTracker
-	GeminiTracker   *ratelimit.GeminiTracker
+	Cfg                *config.Config
+	Strategy           strategy.Strategy
+	Catalog            *catalog.Catalog
+	RateLimiter        *ratelimit.GlobalTracker
+	GeminiTracker      *ratelimit.GeminiTracker
 	ReliabilityTracker *reliability.Tracker
-	HTTPClient      *http.Client
+	HTTPClient         *http.Client
+	OnModelExcluded    func(providerID, modelID string)
 }
 
 // Request is the parsed incoming chat-completions request.
 type Request struct {
-	Model    string           `json:"model"`
-	Messages []map[string]any `json:"messages"`
-	Stream   bool             `json:"stream,omitempty"`
-	MaxTokens int             `json:"max_tokens,omitempty"`
+	Model     string           `json:"model"`
+	Messages  []map[string]any `json:"messages"`
+	Stream    bool             `json:"stream,omitempty"`
+	MaxTokens int              `json:"max_tokens,omitempty"`
 	// Raw holds the original request body for passthrough.
 	Raw map[string]any `json:"-"`
 }
@@ -75,7 +76,7 @@ func (r *Response) usable() bool {
 var ErrNoProviderAvailable = errors.New("no provider produced a response")
 
 const (
-	defaultBackoffInitial = time.Second
+	defaultBackoffInitial = 250 * time.Millisecond
 	defaultBackoffMax     = 30 * time.Second
 	// minRetryDelay keeps a pass that ends right before a cooldown expires
 	// from turning into a busy loop.
@@ -195,6 +196,27 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 	maxAttempts := fc.Cfg.Fallback.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 5
+	}
+
+	// The parallel strategy is a real first-response-wins fan-out. Candidate
+	// selection is bounded by the strategy's fan_out setting, and all requests
+	// share a cancellable context so slow losers stop as soon as one succeeds.
+	if fc.Strategy.Name() == "parallel" {
+		resp, err := fc.executeParallelPass(ctx, req, stratReq, ranked, maxAttempts)
+		if err != nil {
+			return nil, err
+		}
+		if resp != nil {
+			return resp, nil
+		}
+		fallbackResp, fallbackErr := fc.tryOpenRouterFree(ctx, req)
+		if fallbackErr != nil {
+			return nil, fallbackErr
+		}
+		if fallbackResp != nil {
+			return fallbackResp, nil
+		}
+		return nil, fmt.Errorf("no provider answered in this parallel pass (%d candidates)", maxAttempts)
 	}
 
 	// Step 1: Try OpenRouter with models[] array (native fallback)
@@ -342,10 +364,9 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 					modelLevel = false
 					fc.RateLimiter.SetCooldown(r.ProviderID, time.Now().Add(10*time.Minute))
 					log.Printf("fallback: %s auth error %d — cooldown 10min", r.ProviderID, resp.StatusCode)
-				case 404:
-					fc.Catalog.MarkNeedsReverification(r.ProviderID, r.ModelID)
-					fc.RateLimiter.SetCooldown(r.ProviderID+"/"+r.ModelID, time.Now().Add(missingModelCooldown))
-					log.Printf("fallback: %s model %s not found — model cooldown %s", r.ProviderID, r.ModelID, missingModelCooldown)
+				case http.StatusPaymentRequired, http.StatusNotFound:
+					fc.excludeModel(r.ProviderID, r.ModelID)
+					log.Printf("fallback: %s model %s returned %d — excluded from free catalog", r.ProviderID, r.ModelID, resp.StatusCode)
 				}
 			}
 			statusCode := 0
@@ -389,18 +410,201 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 	}
 
 	// Step 5: Ultimate fallback — OpenRouter free router
-	if or := fc.findProvider("openrouter"); or != nil {
-		log.Printf("fallback: trying openrouter/free ultimate fallback")
-		body := OpenRouterFreeRouterRequest(req.Raw)
-		resp, err := fc.callProvider(ctx, *or, body)
-		if err == nil && resp.usable() {
-			fc.ReliabilityTracker.Record("openrouter", true)
-			return resp, nil
-		}
-		fc.ReliabilityTracker.Record("openrouter", false)
+	resp, err := fc.tryOpenRouterFree(ctx, req)
+	if err == nil && resp != nil {
+		return resp, nil
 	}
 
 	return nil, fmt.Errorf("no provider answered in this pass (%d attempts)", attempt)
+}
+
+type parallelCandidate struct {
+	ranked strategy.RankedEntry
+	cfg    config.ProviderConfig
+	body   map[string]any
+}
+
+type parallelResult struct {
+	candidate parallelCandidate
+	resp      *Response
+	err       error
+}
+
+// executeParallelPass races the strategy's provider candidates and returns the
+// first usable completion. Failures received before the winner are still
+// recorded for cooldown and catalog maintenance.
+func (fc *FallbackChain) executeParallelPass(ctx context.Context, req Request, stratReq strategy.Request, ranked []strategy.RankedEntry, maxAttempts int) (*Response, error) {
+	candidates := make([]parallelCandidate, 0, len(ranked))
+	seenProviders := make(map[string]bool)
+	for _, r := range ranked {
+		if len(candidates) >= maxAttempts || seenProviders[r.ProviderID] {
+			continue
+		}
+		pc := fc.findProvider(r.ProviderID)
+		if pc == nil {
+			continue
+		}
+		if fc.RateLimiter != nil && fc.RateLimiter.IsOnCooldown(r.ProviderID) {
+			continue
+		}
+		if fc.RateLimiter != nil && fc.RateLimiter.IsOnCooldown(r.ProviderID+"/"+r.ModelID) {
+			continue
+		}
+		if r.ProviderID == "gemini" && fc.GeminiTracker != nil && !fc.GeminiTracker.CanRequest(r.ModelID, stratReq.EstimatedPromptTokens) {
+			continue
+		}
+		if r.ProviderID == "cerebras" && fc.RateLimiter != nil && !fc.RateLimiter.Provider("cerebras").CanRequest(r.ModelID, 0, 0) {
+			continue
+		}
+
+		body := fc.buildBody(r.ProviderID, req.Raw, r.ModelID)
+		if r.ProviderID == "openrouter" {
+			models := fc.collectProviderModels("openrouter", ranked)
+			body = BuildOpenRouterRequest(req.Raw, models)
+		}
+		callCfg := *pc
+		if fc.RateLimiter != nil {
+			if keys := pc.AllKeys(); len(keys) > 1 {
+				if idx := fc.RateLimiter.CurrentKeyIndex(r.ProviderID); idx < len(keys) {
+					callCfg.APIKey = keys[idx]
+					callCfg.APIKeyEnv = ""
+				}
+			}
+		}
+		candidates = append(candidates, parallelCandidate{ranked: r, cfg: callCfg, body: body})
+		seenProviders[r.ProviderID] = true
+	}
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	callCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan parallelResult, len(candidates))
+	for _, candidate := range candidates {
+		candidate := candidate
+		go func() {
+			if candidate.ranked.ProviderID == "cerebras" && fc.Cfg.Fallback.CerebrasRequestSpacingMs > 0 {
+				if err := sleepCtx(callCtx, time.Duration(fc.Cfg.Fallback.CerebrasRequestSpacingMs)*time.Millisecond); err != nil {
+					results <- parallelResult{candidate: candidate, err: err}
+					return
+				}
+			}
+			resp, err := fc.callProvider(callCtx, candidate.cfg, candidate.body)
+			results <- parallelResult{candidate: candidate, resp: resp, err: err}
+		}()
+	}
+
+	var failures []parallelResult
+	for range candidates {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case result := <-results:
+			if result.err == nil && result.resp != nil && result.resp.usable() {
+				for _, failure := range failures {
+					fc.recordParallelFailure(failure)
+				}
+				providerID := result.candidate.ranked.ProviderID
+				if fc.ReliabilityTracker != nil {
+					fc.ReliabilityTracker.Record(providerID, true)
+				}
+				if providerID == "gemini" && fc.GeminiTracker != nil {
+					fc.GeminiTracker.RecordRequest(result.candidate.ranked.ModelID, stratReq.EstimatedPromptTokens)
+				}
+				if providerID == "cerebras" && fc.RateLimiter != nil {
+					info := ratelimit.ExtractRateLimitInfo("cerebras", result.resp.Header, result.resp.Body)
+					if info.RemainingRequests >= 0 && info.RemainingRequests < 2 {
+						fc.RateLimiter.Provider("cerebras").PreemptiveSlowdown(info.WaitDuration())
+					}
+				}
+				return result.resp, nil
+			}
+			if result.err == nil && result.resp != nil && result.resp.StatusCode == http.StatusOK && result.resp.Empty {
+				if fc.Catalog != nil {
+					fc.Catalog.MarkNeedsReverification(result.candidate.ranked.ProviderID, result.candidate.ranked.ModelID)
+				}
+			}
+			failures = append(failures, result)
+		}
+	}
+	for _, failure := range failures {
+		fc.recordParallelFailure(failure)
+	}
+	return nil, nil
+}
+
+func (fc *FallbackChain) recordParallelFailure(result parallelResult) {
+	providerID := result.candidate.ranked.ProviderID
+	modelID := result.candidate.ranked.ModelID
+	resp := result.resp
+	if result.err != nil && errors.Is(result.err, context.Canceled) {
+		return
+	}
+	if resp != nil {
+		switch resp.StatusCode {
+		case http.StatusTooManyRequests:
+			if fc.Catalog != nil {
+				fc.Catalog.MarkNeedsReverification(providerID, modelID)
+			}
+			info := ratelimit.ExtractRateLimitInfo(providerID, resp.Header, resp.Body)
+			wait := info.WaitDuration()
+			if isZeroQuota(resp.Body) {
+				wait = zeroQuotaCooldown
+			}
+			if fc.RateLimiter != nil {
+				fc.RateLimiter.SetCooldown(providerID+"/"+modelID, time.Now().Add(wait))
+				if result.candidate.cfg.NumKeys() > 1 {
+					fc.RateLimiter.RotateKey(providerID, result.candidate.cfg.NumKeys())
+				}
+			}
+		case http.StatusUnauthorized, http.StatusForbidden:
+			if fc.RateLimiter != nil {
+				fc.RateLimiter.SetCooldown(providerID, time.Now().Add(10*time.Minute))
+			}
+			if fc.ReliabilityTracker != nil {
+				fc.ReliabilityTracker.Record(providerID, false)
+			}
+		case http.StatusPaymentRequired, http.StatusNotFound:
+			fc.excludeModel(providerID, modelID)
+		default:
+			// Model-specific transient failures don't count against provider health.
+		}
+	} else if result.err != nil && fc.ReliabilityTracker != nil {
+		fc.ReliabilityTracker.Record(providerID, false)
+		if fc.RateLimiter != nil && fc.ReliabilityTracker.ShouldCooldown(providerID) {
+			fc.RateLimiter.SetCooldown(providerID, time.Now().Add(30*time.Second))
+		}
+	}
+}
+
+func (fc *FallbackChain) excludeModel(providerID, modelID string) {
+	changed := false
+	if fc.Catalog != nil {
+		changed = fc.Catalog.ExcludeModel(providerID, modelID)
+	}
+	if changed && fc.OnModelExcluded != nil {
+		fc.OnModelExcluded(providerID, modelID)
+	}
+}
+
+func (fc *FallbackChain) tryOpenRouterFree(ctx context.Context, req Request) (*Response, error) {
+	or := fc.findProvider("openrouter")
+	if or == nil {
+		return nil, nil
+	}
+	log.Printf("fallback: trying openrouter/free ultimate fallback")
+	resp, err := fc.callProvider(ctx, *or, OpenRouterFreeRouterRequest(req.Raw))
+	if err == nil && resp != nil && resp.usable() {
+		if fc.ReliabilityTracker != nil {
+			fc.ReliabilityTracker.Record("openrouter", true)
+		}
+		return resp, nil
+	}
+	if fc.ReliabilityTracker != nil {
+		fc.ReliabilityTracker.Record("openrouter", false)
+	}
+	return nil, err
 }
 
 func (fc *FallbackChain) callProvider(ctx context.Context, cfg config.ProviderConfig, body map[string]any) (*Response, error) {
@@ -549,6 +753,9 @@ func (fc *FallbackChain) collectProviderModels(providerID string, ranked []strat
 	for _, r := range ranked {
 		if r.ProviderID == providerID {
 			models = append(models, r.ModelID)
+			if len(models) == maxOpenRouterFallbackModels {
+				break
+			}
 		}
 	}
 	return models
@@ -614,8 +821,6 @@ const (
 	// zeroQuotaCooldown applies when a 429 reports a quota "limit: 0": the
 	// model is listed but not on the free tier, so retrying soon is pointless.
 	zeroQuotaCooldown = 24 * time.Hour
-	// missingModelCooldown applies when a provider returns 404 for a model.
-	missingModelCooldown = time.Hour
 )
 
 // isZeroQuota reports whether a 429 body says the quota for this model is zero

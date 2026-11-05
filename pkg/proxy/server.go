@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,15 +22,16 @@ import (
 
 // Server is the OpenAI-compatible proxy server.
 type Server struct {
-	cfg             atomic.Pointer[config.Config]
-	catalog         atomic.Pointer[catalog.Catalog]
-	strategyReg     *strategy.Registry
-	rateLimiter     *ratelimit.GlobalTracker
-	geminiTracker   *ratelimit.GeminiTracker
+	cfg                atomic.Pointer[config.Config]
+	catalog            atomic.Pointer[catalog.Catalog]
+	strategyReg        *strategy.Registry
+	rateLimiter        *ratelimit.GlobalTracker
+	geminiTracker      *ratelimit.GeminiTracker
 	reliabilityTracker *reliability.Tracker
-	cache           *ResponseCache
-	streamProxy     *StreamProxy
-	httpServer      *http.Server
+	cache              *ResponseCache
+	streamProxy        *StreamProxy
+	httpServer         *http.Server
+	catalogMu          sync.Mutex
 }
 
 // NewServer creates a new proxy Server.
@@ -61,7 +63,38 @@ func (s *Server) UpdateConfig(cfg *config.Config) {
 
 // UpdateCatalog hot-reloads the model catalog.
 func (s *Server) UpdateCatalog(cat *catalog.Catalog) {
+	s.catalogMu.Lock()
+	if current := s.catalog.Load(); current != nil && cat != nil {
+		// Preserve exclusions made by active requests even if a scan or watcher
+		// loaded its snapshot just before that exclusion was saved.
+		for _, blocked := range current.BlocklistSnapshot() {
+			if providerID, modelID, ok := strings.Cut(blocked, "/"); ok {
+				cat.Block(providerID, modelID)
+			}
+		}
+		cat.FilterBlocklisted()
+	}
 	s.catalog.Store(cat)
+	s.catalogMu.Unlock()
+}
+
+// persistExcludedModel applies a definitive 402/404 exclusion to the newest
+// catalog snapshot and writes it to disk. The mutex keeps concurrent requests
+// and catalog hot-reloads from overwriting each other's blocklist updates.
+func (s *Server) persistExcludedModel(providerID, modelID string) {
+	s.catalogMu.Lock()
+	defer s.catalogMu.Unlock()
+
+	cat := s.catalog.Load()
+	if cat == nil {
+		return
+	}
+	cat.ExcludeModel(providerID, modelID)
+	if cfg := s.cfg.Load(); cfg != nil && cfg.Catalog.Path != "" {
+		if err := catalog.Save(cat, cfg.Catalog.Path); err != nil {
+			log.Printf("catalog: failed to persist %s/%s exclusion: %v", providerID, modelID, err)
+		}
+	}
 }
 
 // Start begins listening on the configured port.
@@ -85,9 +118,9 @@ func (s *Server) Start(ctx context.Context) error {
 	handler = authMiddleware(cfg.Proxy.AuthToken, handler)
 
 	s.httpServer = &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Proxy.Port),
-		Handler:      handler,
-		ReadTimeout:  30 * time.Second,
+		Addr:        fmt.Sprintf(":%d", cfg.Proxy.Port),
+		Handler:     handler,
+		ReadTimeout: 30 * time.Second,
 		// A request may legitimately stay pending while no provider is
 		// available, so there is no write deadline; the client's own timeout
 		// (or disconnect) ends the wait.
@@ -234,10 +267,11 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 		GeminiTracker:      s.geminiTracker,
 		ReliabilityTracker: s.reliabilityTracker,
 		HTTPClient:         &http.Client{Timeout: 120 * time.Second},
+		OnModelExcluded:    s.persistExcludedModel,
 	}
 
 	found := false
-	for _, e := range cat.Entries {
+	for _, e := range cat.EntriesSnapshot() {
 		if !matchEntry(e, req.Model, targetProvider, targetModel) {
 			continue
 		}
@@ -253,7 +287,11 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 			delete(body, f)
 		}
 		resp, err := chain.callProvider(r.Context(), *provCfg, body)
-		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && !resp.Empty {
+		if resp != nil && (resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == http.StatusNotFound) {
+			chain.excludeModel(e.ProviderID, e.ModelID)
+			log.Printf("direct route: %s/%s returned %d — excluded from free catalog", e.ProviderID, e.ModelID, resp.StatusCode)
+		}
+		if err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && !resp.Empty {
 			if req.Stream {
 				writeCompletionAsSSE(w, resp.Body)
 				return
@@ -283,7 +321,7 @@ func catalogHasModel(cat *catalog.Catalog, model string) bool {
 	if idx := strings.IndexByte(model, '/'); idx >= 0 {
 		targetProvider, targetModel = model[:idx], model[idx+1:]
 	}
-	for _, e := range cat.Entries {
+	for _, e := range cat.EntriesSnapshot() {
 		if matchEntry(e, model, targetProvider, targetModel) {
 			return true
 		}
@@ -330,6 +368,7 @@ func (s *Server) executeStrategyChain(w http.ResponseWriter, r *http.Request, cf
 		GeminiTracker:      s.geminiTracker,
 		ReliabilityTracker: s.reliabilityTracker,
 		HTTPClient:         &http.Client{Timeout: 120 * time.Second},
+		OnModelExcluded:    s.persistExcludedModel,
 	}
 
 	// Always use the fallback chain regardless of stream flag.
@@ -482,10 +521,9 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 // so requests don't spend a round trip on a guaranteed 401.
 func findProviderCfg(cfg *config.Config, providerID string) *config.ProviderConfig {
 	for i := range cfg.Providers {
-		if cfg.Providers[i].ID == providerID && cfg.Providers[i].Enabled && !cfg.Providers[i].MissingKey() {
+		if cfg.Providers[i].ID == providerID && cfg.Providers[i].IsEnabled() {
 			return &cfg.Providers[i]
 		}
 	}
 	return nil
 }
-
