@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/catalog"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/config"
+	"github.com/kaiser-data/free-llm-proxy-router/pkg/logging"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/ratelimit"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/reliability"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/strategy"
@@ -93,9 +93,10 @@ func (s *Server) persistExcludedModel(providerID, modelID string) {
 	cat.ExcludeModel(providerID, modelID)
 	if cfg := s.cfg.Load(); cfg != nil && cfg.Catalog.Path != "" {
 		if err := catalog.Save(cat, cfg.Catalog.Path); err != nil {
-			log.Printf("catalog: failed to persist %s/%s exclusion: %v", providerID, modelID, err)
+			logging.Warn("catalog: failed to persist %s/%s exclusion: %v", providerID, modelID, err)
 		}
 	}
+	logging.Info("catalog: excluded model %s/%s from free catalog", providerID, modelID)
 }
 
 // Start begins listening on the configured port.
@@ -130,7 +131,7 @@ func (s *Server) Start(ctx context.Context) error {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	log.Printf("free-llm-proxy listening on :%d (strategy: %s)", cfg.Proxy.Port, cfg.Proxy.Strategy)
+	logging.Info("free-llm-proxy listening on :%d (strategy: %s, cache_ttl=%ds)", cfg.Proxy.Port, cfg.Proxy.Strategy, cfg.Proxy.CacheTTL)
 
 	go func() {
 		<-ctx.Done()
@@ -206,7 +207,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		// A pinned model that has left the free catalog falls back to the
 		// profile's strategy rather than failing every request.
 		if profile.Model != "" && !catalogHasModel(cat, profile.Model) {
-			log.Printf("agent profile %q: pinned model %q not in free catalog — using strategy instead", req.Model, profile.Model)
+			logging.Info("agent profile %q: pinned model %q not in free catalog — using strategy instead", req.Model, profile.Model)
 			profile.Model = ""
 		}
 		if profile.Model != "" {
@@ -220,7 +221,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			req.Model = ""
 			raw["model"] = ""
 		}
-		log.Printf("agent profile resolved: model=%q strategy=%q", profile.Model, profile.Strategy)
+		logging.Debug("agent profile resolved: model=%q strategy=%q", profile.Model, profile.Strategy)
 	}
 
 	// Check cache for non-streaming requests
@@ -306,7 +307,7 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 		resp, err := chain.callProvider(ctx, *provCfg, body)
 		if resp != nil && (resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == http.StatusNotFound) {
 			chain.excludeModel(e.ProviderID, e.ModelID)
-			log.Printf("direct route: %s/%s returned %d — excluded from free catalog", e.ProviderID, e.ModelID, resp.StatusCode)
+			logging.Info("direct route: %s/%s returned %d — excluded from free catalog", e.ProviderID, e.ModelID, resp.StatusCode)
 		}
 		if err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 && !resp.Empty {
 			if req.Stream {
@@ -328,12 +329,12 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 		return // client went away; nobody to answer
 	}
 	if ctx.Err() != nil {
-		log.Printf("direct route: no answer from %q within fallback.max_wait (%s)", req.Model, cfg.Fallback.MaxWait)
+		logging.Warn("direct route: no answer from %q within fallback.max_wait (%s)", req.Model, cfg.Fallback.MaxWait)
 		writeProxyError(w, http.StatusServiceUnavailable, fmt.Errorf("%w within %s", ErrNoProviderAvailable, cfg.Fallback.MaxWait))
 		return
 	}
 	// Model found but all direct attempts failed — fall back to strategy chain.
-	log.Printf("direct route: all providers failed for %q — falling back to strategy chain", req.Model)
+	logging.Info("direct route: all providers failed for %q — falling back to strategy chain", req.Model)
 	req.Model = ""
 	raw["model"] = ""
 	s.executeStrategyChain(w, r, cfg, cat, req, raw)
@@ -381,8 +382,9 @@ func (s *Server) executeStrategyChain(w http.ResponseWriter, r *http.Request, cf
 
 	strat, err := s.strategyReg.Get(stratName)
 	if err != nil {
-		log.Printf("unknown strategy %q (smart is the only strategy)", stratName)
+		logging.Warn("unknown strategy %q (smart is the only strategy)", stratName)
 	}
+	logging.Debug("routing: strategy=%s stream=%t model=%s", stratName, req.Stream, req.Model)
 
 	chain := &FallbackChain{
 		Cfg:                cfg,
@@ -403,10 +405,10 @@ func (s *Server) executeStrategyChain(w http.ResponseWriter, r *http.Request, cf
 	resp, sseStarted, err := executePending(w, r, chain, req)
 	if err != nil {
 		if r.Context().Err() != nil {
-			log.Printf("request abandoned while waiting for a provider: %v", err)
+			logging.Debug("request abandoned while waiting for a provider: %v", err)
 			return // client disconnected or proxy shutting down; nobody to answer
 		}
-		log.Printf("no provider answered: %v", err)
+		logging.Warn("no provider answered: %v", err)
 		// Never answer with a fake completion: report the failure as an error.
 		if sseStarted {
 			// Status 200 is already on the wire; end the stream with an error event.

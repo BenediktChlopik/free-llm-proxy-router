@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net/http"
 	"strings"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/catalog"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/config"
+	"github.com/kaiser-data/free-llm-proxy-router/pkg/logging"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/ratelimit"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/reliability"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/strategy"
@@ -146,8 +146,10 @@ func (fc *FallbackChain) Execute(parent context.Context, req Request) (*Response
 	demoted := make(map[string]bool)
 
 	for pass := 1; ; pass++ {
+		logging.Debug("fallback: pass %d starting (max_wait=%s, max_attempts=%d)", pass, fc.Cfg.Fallback.MaxWait, fc.Cfg.Fallback.MaxAttempts)
 		resp, err := fc.executePass(ctx, req, demoted)
 		if err == nil {
+			logging.Info("fallback: success after %d pass(es)", pass)
 			return resp, nil
 		}
 		if cerr := parent.Err(); cerr != nil {
@@ -168,7 +170,7 @@ func (fc *FallbackChain) Execute(parent context.Context, req Request) (*Response
 				delay = remaining
 			}
 		}
-		log.Printf("fallback: pass %d found no provider (%v) — request stays pending, retrying in %s", pass, err, delay.Round(time.Millisecond))
+		logging.Info("fallback: pass %d found no provider (%v) — retrying in %s", pass, err, delay.Round(time.Millisecond))
 		if serr := sleepCtx(ctx, delay); serr != nil {
 			if cerr := parent.Err(); cerr != nil {
 				return nil, cerr
@@ -283,7 +285,7 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 				fc.ReliabilityTracker.Record("openrouter", true)
 				return resp, nil
 			}
-			log.Printf("fallback: openrouter models[] failed — continuing%s", upstreamErrSnippet(resp, err))
+			logging.Debug("fallback: openrouter models[] failed — continuing%s", upstreamErrSnippet(resp, err))
 			fc.ReliabilityTracker.Record("openrouter", false)
 		}
 	}
@@ -317,13 +319,13 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 
 		// Skip any provider currently on rate-limit cooldown (auth errors).
 		if fc.RateLimiter.IsOnCooldown(r.ProviderID) {
-			log.Printf("fallback: %s on cooldown — skipping provider", r.ProviderID)
+			logging.Debug("fallback: %s on cooldown — skipping provider", r.ProviderID)
 			failedProviders[r.ProviderID] = true
 			continue
 		}
 		// Skip this specific model if it is rate-limited, but keep trying other models.
 		if fc.RateLimiter.IsOnCooldown(r.ProviderID + "/" + r.ModelID) {
-			log.Printf("fallback: %s/%s rate-limited — skipping model", r.ProviderID, r.ModelID)
+			logging.Debug("fallback: %s/%s rate-limited — skipping model", r.ProviderID, r.ModelID)
 			continue
 		}
 
@@ -331,7 +333,7 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 		if r.ProviderID == "cerebras" {
 			tracker := fc.RateLimiter.Provider("cerebras")
 			if !tracker.CanRequest(r.ModelID, 0, 0) {
-				log.Printf("fallback: cerebras pre-emptive skip (rate limited)")
+				logging.Debug("fallback: cerebras pre-emptive skip (rate limited)")
 				failedProviders[r.ProviderID] = true
 				continue
 			}
@@ -346,7 +348,7 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 		// Gemini 4-dimensional rate check.
 		if r.ProviderID == "gemini" && fc.GeminiTracker != nil {
 			if !fc.GeminiTracker.CanRequest(r.ModelID, stratReq.EstimatedPromptTokens) {
-				log.Printf("fallback: gemini %s rate limited — skipping", r.ModelID)
+				logging.Debug("fallback: gemini %s rate limited — skipping", r.ModelID)
 				failedProviders[r.ProviderID] = true
 				continue
 			}
@@ -368,7 +370,7 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 			// The provider answered 200 but with nothing in it. Treat it like a
 			// failure, but prefer *other providers* before asking this one again:
 			// skip it for the rest of this pass and demote it for later passes.
-			log.Printf("fallback: %s/%s returned an empty completion — trying other providers first", r.ProviderID, r.ModelID)
+			logging.Debug("fallback: %s/%s returned an empty completion — trying other providers first", r.ProviderID, r.ModelID)
 			demoted[r.ProviderID+"/"+r.ModelID] = true
 			failedProviders[r.ProviderID] = true
 			continue
@@ -377,7 +379,7 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 			// HuggingFace 503+loading: wait and retry SAME provider (cold start).
 			if r.ProviderID == "huggingface" && resp != nil && resp.StatusCode == 503 {
 				if waitMs := parseHFLoadingWait(resp.Body); waitMs > 0 {
-					log.Printf("fallback: huggingface model loading, waiting %dms", waitMs)
+					logging.Info("fallback: huggingface model loading, waiting %dms", waitMs)
 					if serr := sleepCtx(ctx, time.Duration(waitMs)*time.Millisecond); serr != nil {
 						return nil, serr
 					}
@@ -414,37 +416,37 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 					// Rotate to the next API key slot if multiple keys are configured.
 					if providerCfg != nil && providerCfg.NumKeys() > 1 {
 						newIdx := fc.RateLimiter.RotateKey(r.ProviderID, providerCfg.NumKeys())
-						log.Printf("fallback: %s/%s rate limited — rotated to key slot %d", r.ProviderID, r.ModelID, newIdx+1)
+						logging.Info("fallback: %s/%s rate limited — rotated to key slot %d", r.ProviderID, r.ModelID, newIdx+1)
 					} else {
-						log.Printf("fallback: %s/%s rate limited — model cooldown %s", r.ProviderID, r.ModelID, waitDur.Round(time.Second))
+						logging.Info("fallback: %s/%s rate limited — model cooldown %s", r.ProviderID, r.ModelID, waitDur.Round(time.Second))
 					}
 				case 401, 403:
 					modelLevel = false
 					fc.RateLimiter.SetCooldown(r.ProviderID, time.Now().Add(10*time.Minute))
-					log.Printf("fallback: %s auth error %d — cooldown 10min", r.ProviderID, resp.StatusCode)
+					logging.Warn("fallback: %s auth error %d — cooldown 10min", r.ProviderID, resp.StatusCode)
 				case http.StatusPaymentRequired, http.StatusNotFound:
 					fc.excludeModel(r.ProviderID, r.ModelID)
-					log.Printf("fallback: %s model %s returned %d — excluded from free catalog", r.ProviderID, r.ModelID, resp.StatusCode)
+					logging.Info("fallback: %s model %s returned %d — excluded from free catalog", r.ProviderID, r.ModelID, resp.StatusCode)
 				}
 			}
 			statusCode := 0
 			if resp != nil {
 				statusCode = resp.StatusCode
 			}
-			providerTries[r.ProviderID]++
+						providerTries[r.ProviderID]++
 			if modelLevel && providerTries[r.ProviderID] < maxModelsPerProvider {
 				// The provider itself is fine; try its next ranked model.
-				log.Printf("fallback: %s/%s status %d — trying next model%s", r.ProviderID, r.ModelID, statusCode, upstreamErrSnippet(resp, err))
+				logging.Debug("fallback: %s/%s status %d — trying next model%s", r.ProviderID, r.ModelID, statusCode, upstreamErrSnippet(resp, err))
 				continue
 			}
-			log.Printf("fallback: %s/%s status %d — skipping provider%s", r.ProviderID, r.ModelID, statusCode, upstreamErrSnippet(resp, err))
+			logging.Debug("fallback: %s/%s status %d — skipping provider%s", r.ProviderID, r.ModelID, statusCode, upstreamErrSnippet(resp, err))
 			// Model-level failures say nothing about the provider's health, so
 			// only auth and transport errors count against its reliability.
 			if !modelLevel {
 				fc.ReliabilityTracker.Record(r.ProviderID, false)
 				if fc.ReliabilityTracker.ShouldCooldown(r.ProviderID) {
 					fc.RateLimiter.SetCooldown(r.ProviderID, time.Now().Add(30*time.Second))
-					log.Printf("fallback: %s reliability below 50%% — short cooldown", r.ProviderID)
+					logging.Warn("fallback: %s reliability below 50%% — short cooldown", r.ProviderID)
 				}
 			}
 			failedProviders[r.ProviderID] = true // don't try other models from this provider
@@ -655,7 +657,7 @@ func (fc *FallbackChain) tryOpenRouterFree(ctx context.Context, req Request) (*R
 	if or == nil {
 		return nil, nil
 	}
-	log.Printf("fallback: trying openrouter/free ultimate fallback")
+	logging.Info("fallback: trying openrouter/free ultimate fallback")
 	resp, err := fc.callProvider(ctx, *or, OpenRouterFreeRouterRequest(req.Raw))
 	if err == nil && resp != nil && resp.usable() {
 		if fc.ReliabilityTracker != nil {

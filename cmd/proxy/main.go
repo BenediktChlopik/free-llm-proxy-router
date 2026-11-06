@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/catalog"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/config"
+	"github.com/kaiser-data/free-llm-proxy-router/pkg/logging"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/models"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/proxy"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/ratelimit"
@@ -53,15 +53,18 @@ func runProxy(cmd *cobra.Command, args []string) error {
 		cfg.Proxy.Port = port
 	}
 
+	logging.Set(cfg.Proxy.LogLevel)
+	logging.Info("proxy starting, log_level=%s", cfg.Proxy.LogLevel)
+
 	// Load model catalog
 	cat, err := catalog.Load(cfg.Catalog.Path)
 	if err != nil {
 		return fmt.Errorf("loading catalog: %w", err)
 	}
 	freeCount := len(cat.FreeEntries())
-	log.Printf("catalog: %d free model(s) loaded from %s", freeCount, cfg.Catalog.Path)
+	logging.Info("catalog: %d free model(s) loaded from %s", freeCount, cfg.Catalog.Path)
 	if freeCount == 0 {
-		log.Printf("warning: catalog is empty — run 'free-llm-scan update' to discover free models")
+		logging.Warn("catalog is empty — run 'free-llm-scan update' to discover free models")
 	}
 
 	var ready, noKey, disabled []string
@@ -77,29 +80,28 @@ func runProxy(cmd *cobra.Command, args []string) error {
 			disabled = append(disabled, p.ID)
 		}
 	}
-	log.Printf("providers ready: %s", strings.Join(ready, ", "))
+	logging.Info("providers ready: %s", strings.Join(ready, ", "))
 	if len(noKey) > 0 {
-		log.Printf("providers skipped (missing .env key): %s", strings.Join(noKey, ", "))
+		logging.Info("providers skipped (missing .env key): %s", strings.Join(noKey, ", "))
 	}
 	if len(disabled) > 0 {
-		log.Printf("providers disabled by .env toggle: %s", strings.Join(disabled, ", "))
+		logging.Info("providers disabled by .env toggle: %s", strings.Join(disabled, ", "))
 	}
 	if len(ready) == 0 {
-		log.Printf("warning: no provider has an API key — add one to .env (see .env.example)")
+		logging.Warn("no provider has an API key — add one to .env (see .env.example)")
 	}
 
 	// Check catalog staleness
 	if catalog.IsStale(cfg.Catalog.Path, time.Duration(cfg.Catalog.MaxAgeHours)*time.Hour) {
-		log.Printf("warning: catalog is older than %dh — consider running 'free-llm-scan update'",
-			cfg.Catalog.MaxAgeHours)
+		logging.Warn("catalog is older than %dh — consider running 'free-llm-scan update'", cfg.Catalog.MaxAgeHours)
 	}
 
 	// Load capability/family YAML data if present
 	if err := models.LoadFamilies(config.FindDataFile("families.yaml", cfgFile)); err != nil {
-		log.Printf("families.yaml not found or invalid: %v (family detection disabled)", err)
+		logging.Debug("families.yaml not found or invalid: %v (family detection disabled)", err)
 	}
 	if err := models.LoadCapabilities(config.FindDataFile("capabilities.yaml", cfgFile)); err != nil {
-		log.Printf("capabilities.yaml not found or invalid: %v (capability detection disabled)", err)
+		logging.Debug("capabilities.yaml not found or invalid: %v (capability detection disabled)", err)
 	}
 
 	// Set up rate limiters
@@ -109,14 +111,14 @@ func runProxy(cmd *cobra.Command, args []string) error {
 	// Load persisted rate-limit usage
 	usagePath := "~/.free-llm-proxy-router/usage.json"
 	if _, err := ratelimit.LoadUsage(usagePath); err != nil {
-		log.Printf("usage.json not found (starting fresh): %v", err)
+		logging.Debug("usage.json not found (starting fresh): %v", err)
 	}
 
 	// Set up reliability tracker
 	reliabilityTracker := reliability.New()
 	relPath := "~/.free-llm-proxy-router/reliability.json"
 	if err := reliability.Load(reliabilityTracker, relPath); err != nil {
-		log.Printf("reliability.json not found (starting fresh): %v", err)
+		logging.Debug("reliability.json not found (starting fresh): %v", err)
 	}
 
 	// Set up strategy registry
@@ -132,10 +134,10 @@ func runProxy(cmd *cobra.Command, args []string) error {
 	// Watch catalog file for hot-reload (triggered by git-sync pull or manual update).
 	stopCatalogWatch, err := catalog.Watch(cfg.Catalog.Path, func(newCat *catalog.Catalog) {
 		srv.UpdateCatalog(newCat)
-		log.Printf("catalog: hot-reloaded (%d models)", len(newCat.FreeEntries()))
+		logging.Info("catalog: hot-reloaded (%d models)", len(newCat.FreeEntries()))
 	})
 	if err != nil {
-		log.Printf("catalog watch error (hot-reload disabled): %v", err)
+		logging.Warn("catalog watch error (hot-reload disabled): %v", err)
 	} else {
 		defer stopCatalogWatch()
 	}
@@ -161,10 +163,10 @@ func runProxy(cmd *cobra.Command, args []string) error {
 	// Watch config for hot-reload
 	stopWatch, err := config.Watch(cfgFile, func(newCfg *config.Config) {
 		srv.UpdateConfig(newCfg)
-		log.Printf("proxy: config hot-reloaded")
+		logging.Info("proxy: config hot-reloaded")
 	})
 	if err != nil {
-		log.Printf("config watch error (hot-reload disabled): %v", err)
+		logging.Warn("config watch error (hot-reload disabled): %v", err)
 	} else {
 		defer stopWatch()
 	}
@@ -173,10 +175,10 @@ func runProxy(cmd *cobra.Command, args []string) error {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		log.Printf("proxy: shutting down...")
+		logging.Info("proxy: shutting down...")
 		// Save reliability stats on shutdown
 		if err := reliability.Save(reliabilityTracker, relPath); err != nil {
-			log.Printf("saving reliability: %v", err)
+			logging.Warn("saving reliability: %v", err)
 		}
 		cancel()
 	}()

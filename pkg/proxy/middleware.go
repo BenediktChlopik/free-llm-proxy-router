@@ -1,9 +1,10 @@
 package proxy
 
 import (
-	"log"
 	"net/http"
 	"time"
+
+	"github.com/kaiser-data/free-llm-proxy-router/pkg/logging"
 )
 
 // authMiddleware checks the optional proxy auth token.
@@ -23,14 +24,35 @@ func authMiddleware(token string, next http.Handler) http.Handler {
 	})
 }
 
-// loggingMiddleware logs request method, path, status, and duration.
-// It does NOT log Authorization headers, request bodies, or API keys.
+// loggingMiddleware logs request method, path, query params, status, duration,
+// and body size (for POST requests). It does NOT log Authorization headers,
+// request bodies, or API keys.
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+
+		// Capture request details for debug logging
+		query := r.URL.RawQuery
+		if query != "" {
+			logging.Debug("http: incoming %s %s?%s", r.Method, r.URL.Path, query)
+		} else {
+			logging.Debug("http: incoming %s %s", r.Method, r.URL.Path)
+		}
+
+		// Log body size for POST/PUT requests (not the content)
+		if r.Method == http.MethodPost || r.Method == http.MethodPut {
+			if r.ContentLength > 0 {
+				logging.Debug("http: request body size=%d bytes", r.ContentLength)
+			} else if r.ContentLength == -1 {
+				logging.Debug("http: request body size=unknown (chunked)")
+			}
+		}
+
 		next.ServeHTTP(rw, r)
-		log.Printf("%s %s %d %v", r.Method, r.URL.Path, rw.status, time.Since(start))
+
+		elapsed := time.Since(start)
+		logging.Info("%s %s %d %v", r.Method, r.URL.Path, rw.status, elapsed)
 	})
 }
 
@@ -39,7 +61,7 @@ func recoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				log.Printf("panic: %v", rec)
+				logging.Warn("panic: %v", rec)
 				http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
 			}
 		}()
