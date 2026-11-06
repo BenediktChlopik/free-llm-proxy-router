@@ -51,6 +51,11 @@ type Request struct {
 	MaxTokens int              `json:"max_tokens,omitempty"`
 	// Raw holds the original request body for passthrough.
 	Raw map[string]any `json:"-"`
+
+	// deadline, when set, is the absolute time by which the request must be
+	// answered. It is carried across a route change (direct model → strategy
+	// chain) so the time already spent counts against fallback.max_wait.
+	deadline time.Time
 }
 
 // Response wraps an upstream HTTP response.
@@ -75,6 +80,16 @@ func (r *Response) usable() bool {
 // set and no provider produced a real response within that time.
 var ErrNoProviderAvailable = errors.New("no provider produced a response")
 
+// NoEligibleModelError is returned by Execute when a strict strategy (see
+// strategy.Strict) filtered out every free model, e.g. the prompt is larger than
+// any context window or no model supports the tools the request carries.
+// Retrying cannot help, so Execute returns it immediately.
+type NoEligibleModelError struct {
+	Reason string
+}
+
+func (e *NoEligibleModelError) Error() string { return e.Reason }
+
 const (
 	defaultBackoffInitial = 250 * time.Millisecond
 	defaultBackoffMax     = 30 * time.Second
@@ -93,7 +108,14 @@ const (
 // completion: it returns either an upstream response, ctx.Err() when the
 // client went away, or — only if Fallback.MaxWait is set and exceeded —
 // ErrNoProviderAvailable.
-func (fc *FallbackChain) Execute(ctx context.Context, req Request) (*Response, error) {
+//
+// Fallback.MaxWait is a hard cap on the whole call: it is applied as a deadline
+// to every provider request and wait, so an in-flight call is cut off when the
+// time is up instead of being allowed to finish first.
+//
+// A strict strategy that leaves no eligible model makes Execute return a
+// *NoEligibleModelError at once.
+func (fc *FallbackChain) Execute(parent context.Context, req Request) (*Response, error) {
 	backoff, backoffMax := fc.Cfg.Fallback.RetryBackoffInitial, fc.Cfg.Fallback.RetryBackoffMax
 	if backoff <= 0 {
 		backoff = defaultBackoffInitial
@@ -105,7 +127,19 @@ func (fc *FallbackChain) Execute(ctx context.Context, req Request) (*Response, e
 		backoffMax = backoff
 	}
 	maxWait := fc.Cfg.Fallback.MaxWait
-	deadline := time.Now().Add(maxWait)
+	deadline := req.deadline
+	if deadline.IsZero() && maxWait > 0 {
+		deadline = time.Now().Add(maxWait)
+	}
+	ctx := parent
+	if !deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(parent, deadline)
+		defer cancel()
+	}
+	timedOut := func(pass int, cause error) error {
+		return fmt.Errorf("%w within %s (%d passes): %v", ErrNoProviderAvailable, maxWait, pass, cause)
+	}
 
 	// Provider/model pairs that returned an empty response during this request.
 	// Later passes try every other candidate first and retry these last.
@@ -116,15 +150,19 @@ func (fc *FallbackChain) Execute(ctx context.Context, req Request) (*Response, e
 		if err == nil {
 			return resp, nil
 		}
-		if cerr := ctx.Err(); cerr != nil {
+		if cerr := parent.Err(); cerr != nil {
 			return nil, cerr // client went away or shutdown; nobody to answer
+		}
+		var noModel *NoEligibleModelError
+		if errors.As(err, &noModel) {
+			return nil, err // no retry can make a model eligible
 		}
 
 		delay := fc.retryDelay(backoff)
-		if maxWait > 0 {
+		if !deadline.IsZero() {
 			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				return nil, fmt.Errorf("%w within %s (%d passes): %v", ErrNoProviderAvailable, maxWait, pass, err)
+			if remaining <= 0 || ctx.Err() != nil {
+				return nil, timedOut(pass, err)
 			}
 			if delay > remaining {
 				delay = remaining
@@ -132,7 +170,10 @@ func (fc *FallbackChain) Execute(ctx context.Context, req Request) (*Response, e
 		}
 		log.Printf("fallback: pass %d found no provider (%v) — request stays pending, retrying in %s", pass, err, delay.Round(time.Millisecond))
 		if serr := sleepCtx(ctx, delay); serr != nil {
-			return nil, serr
+			if cerr := parent.Err(); cerr != nil {
+				return nil, cerr
+			}
+			return nil, timedOut(pass, err)
 		}
 		if backoff *= 2; backoff > backoffMax {
 			backoff = backoffMax
@@ -184,15 +225,26 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 		demoted = make(map[string]bool)
 	}
 	freeEntries := fc.Catalog.FreeEntries()
+	needsTools, needsVision := requestNeeds(req)
 	stratReq := strategy.Request{
 		Messages:              req.Messages,
-		EstimatedPromptTokens: estimateTokens(req.Messages),
+		EstimatedPromptTokens: estimateRequestTokens(req),
 		MaxTokens:             req.MaxTokens,
 		Stream:                req.Stream,
 		Model:                 req.Model,
+		NeedsTools:            needsTools,
+		NeedsVision:           needsVision,
+		Options:               fc.Cfg.Proxy.StrategyOverrides[fc.Strategy.Name()],
 	}
 
+	// A strict strategy's ranked list is a hard filter: the chain stays inside
+	// it (no unfiltered last-resort router) and gives up at once if it is empty.
+	strictStrat, strict := fc.Strategy.(strategy.Strict)
+
 	ranked := demoteRanked(fc.Strategy.Rank(stratReq, freeEntries, nil), demoted)
+	if strict && len(ranked) == 0 && len(freeEntries) > 0 {
+		return nil, &NoEligibleModelError{Reason: strictStrat.Explain(stratReq, freeEntries, nil)}
+	}
 	maxAttempts := fc.Cfg.Fallback.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 5
@@ -209,12 +261,14 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 		if resp != nil {
 			return resp, nil
 		}
-		fallbackResp, fallbackErr := fc.tryOpenRouterFree(ctx, req)
-		if fallbackErr != nil {
-			return nil, fallbackErr
-		}
-		if fallbackResp != nil {
-			return fallbackResp, nil
+		if !strict {
+			fallbackResp, fallbackErr := fc.tryOpenRouterFree(ctx, req)
+			if fallbackErr != nil {
+				return nil, fallbackErr
+			}
+			if fallbackResp != nil {
+				return fallbackResp, nil
+			}
 		}
 		return nil, fmt.Errorf("no provider answered in this parallel pass (%d candidates)", maxAttempts)
 	}
@@ -283,7 +337,9 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 			}
 			spacingMs := fc.Cfg.Fallback.CerebrasRequestSpacingMs
 			if spacingMs > 0 {
-				time.Sleep(time.Duration(spacingMs) * time.Millisecond)
+				if err := sleepCtx(ctx, time.Duration(spacingMs)*time.Millisecond); err != nil {
+					return nil, err
+				}
 			}
 		}
 
@@ -322,7 +378,9 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 			if r.ProviderID == "huggingface" && resp != nil && resp.StatusCode == 503 {
 				if waitMs := parseHFLoadingWait(resp.Body); waitMs > 0 {
 					log.Printf("fallback: huggingface model loading, waiting %dms", waitMs)
-					time.Sleep(time.Duration(waitMs) * time.Millisecond)
+					if serr := sleepCtx(ctx, time.Duration(waitMs)*time.Millisecond); serr != nil {
+						return nil, serr
+					}
 					resp, err = fc.callProvider(ctx, *providerCfg, body)
 					if err == nil && resp.StatusCode == http.StatusOK {
 						fc.ReliabilityTracker.Record(r.ProviderID, true)
@@ -409,10 +467,14 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 		return resp, nil
 	}
 
-	// Step 5: Ultimate fallback — OpenRouter free router
-	resp, err := fc.tryOpenRouterFree(ctx, req)
-	if err == nil && resp != nil {
-		return resp, nil
+	// Step 5: Ultimate fallback — OpenRouter free router. It picks any model, so
+	// it is skipped for strict strategies, whose candidates must all meet the
+	// request's requirements.
+	if !strict {
+		resp, err := fc.tryOpenRouterFree(ctx, req)
+		if err == nil && resp != nil {
+			return resp, nil
+		}
 	}
 
 	return nil, fmt.Errorf("no provider answered in this pass (%d attempts)", attempt)
@@ -864,13 +926,86 @@ func parseHFLoadingWait(body []byte) int64 {
 	return 30_000 // default 30s if not specified
 }
 
-// estimateTokens gives a rough token count for a message list (4 chars ≈ 1 token).
-func estimateTokens(msgs []map[string]any) int {
+const (
+	// imageTokenEstimate is a flat allowance per image part; real cost varies by
+	// provider and resolution.
+	imageTokenEstimate = 800
+	// messageOverheadTokens covers role markers and separators per message.
+	messageOverheadTokens = 4
+)
+
+// estimateRequestTokens gives a rough input token count (4 chars ≈ 1 token). It
+// counts text in string and part-list content, tool calls the assistant made
+// earlier, images, and the tool/function definitions the request carries —
+// which can dominate the prompt in agent workloads.
+func estimateRequestTokens(req Request) int {
 	total := 0
-	for _, m := range msgs {
-		if content, ok := m["content"].(string); ok {
-			total += len(content) / 4
+	for _, m := range req.Messages {
+		total += messageOverheadTokens
+		switch c := m["content"].(type) {
+		case string:
+			total += len(c) / 4
+		case []any:
+			for _, part := range c {
+				p, ok := part.(map[string]any)
+				if !ok {
+					continue
+				}
+				if text, isText := p["text"].(string); isText {
+					total += len(text) / 4
+				} else if isImagePart(p) {
+					total += imageTokenEstimate
+				}
+			}
+		}
+		if calls, ok := m["tool_calls"]; ok {
+			if b, err := json.Marshal(calls); err == nil {
+				total += len(b) / 4
+			}
+		}
+	}
+	for _, key := range []string{"tools", "functions"} {
+		if defs, ok := req.Raw[key]; ok {
+			if b, err := json.Marshal(defs); err == nil {
+				total += len(b) / 4
+			}
 		}
 	}
 	return total
+}
+
+// requestNeeds reports the capabilities a request requires of the serving
+// model: tool calling (tool/function definitions, or tool calls and results in
+// the conversation) and vision (image content).
+func requestNeeds(req Request) (tools, vision bool) {
+	for _, key := range []string{"tools", "functions"} {
+		if defs, ok := req.Raw[key].([]any); ok && len(defs) > 0 {
+			tools = true
+		}
+	}
+	for _, m := range req.Messages {
+		if role, _ := m["role"].(string); role == "tool" || role == "function" {
+			tools = true
+		}
+		if calls, ok := m["tool_calls"].([]any); ok && len(calls) > 0 {
+			tools = true
+		}
+		if parts, ok := m["content"].([]any); ok {
+			for _, part := range parts {
+				if p, ok := part.(map[string]any); ok && isImagePart(p) {
+					vision = true
+				}
+			}
+		}
+	}
+	return tools, vision
+}
+
+// isImagePart reports whether a content part carries an image.
+func isImagePart(p map[string]any) bool {
+	switch t, _ := p["type"].(string); t {
+	case "image_url", "image", "input_image":
+		return true
+	}
+	return false
 }

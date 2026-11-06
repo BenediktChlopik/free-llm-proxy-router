@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -270,8 +271,24 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 		OnModelExcluded:    s.persistExcludedModel,
 	}
 
+	// fallback.max_wait is a hard cap here too. The deadline travels with the
+	// request, so time spent on direct attempts also counts against the
+	// strategy chain if the request falls back to it.
+	if mw := cfg.Fallback.MaxWait; mw > 0 && req.deadline.IsZero() {
+		req.deadline = time.Now().Add(mw)
+	}
+	ctx := r.Context()
+	if !req.deadline.IsZero() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, req.deadline)
+		defer cancel()
+	}
+
 	found := false
 	for _, e := range cat.EntriesSnapshot() {
+		if ctx.Err() != nil {
+			break
+		}
 		if !matchEntry(e, req.Model, targetProvider, targetModel) {
 			continue
 		}
@@ -286,7 +303,7 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 		for _, f := range anthropicOnlyFields {
 			delete(body, f)
 		}
-		resp, err := chain.callProvider(r.Context(), *provCfg, body)
+		resp, err := chain.callProvider(ctx, *provCfg, body)
 		if resp != nil && (resp.StatusCode == http.StatusPaymentRequired || resp.StatusCode == http.StatusNotFound) {
 			chain.excludeModel(e.ProviderID, e.ModelID)
 			log.Printf("direct route: %s/%s returned %d — excluded from free catalog", e.ProviderID, e.ModelID, resp.StatusCode)
@@ -305,6 +322,14 @@ func (s *Server) serveDirectModel(w http.ResponseWriter, r *http.Request, cfg *c
 	}
 	if !found {
 		http.Error(w, fmt.Sprintf(`{"error":"model %q not found in free catalog"}`, req.Model), http.StatusNotFound)
+		return
+	}
+	if r.Context().Err() != nil {
+		return // client went away; nobody to answer
+	}
+	if ctx.Err() != nil {
+		log.Printf("direct route: no answer from %q within fallback.max_wait (%s)", req.Model, cfg.Fallback.MaxWait)
+		writeProxyError(w, http.StatusServiceUnavailable, fmt.Errorf("%w within %s", ErrNoProviderAvailable, cfg.Fallback.MaxWait))
 		return
 	}
 	// Model found but all direct attempts failed — fall back to strategy chain.
@@ -393,7 +418,7 @@ func (s *Server) executeStrategyChain(w http.ResponseWriter, r *http.Request, cf
 			}
 			return
 		}
-		writeProxyError(w, http.StatusServiceUnavailable, err)
+		writeProxyError(w, proxyErrorStatus(err), err)
 		return
 	}
 
@@ -470,11 +495,27 @@ func executePending(w http.ResponseWriter, r *http.Request, chain *FallbackChain
 
 // proxyErrorBody builds an OpenAI-style error object (not a completion).
 func proxyErrorBody(err error) map[string]any {
+	errType, code := "service_unavailable", "no_provider_available"
+	var noModel *NoEligibleModelError
+	if errors.As(err, &noModel) {
+		errType, code = "invalid_request_error", "no_eligible_model"
+	}
 	return map[string]any{"error": map[string]any{
 		"message": err.Error(),
-		"type":    "service_unavailable",
-		"code":    "no_provider_available",
+		"type":    errType,
+		"code":    code,
 	}}
+}
+
+// proxyErrorStatus maps a chain failure to an HTTP status: a request that no
+// model can serve is the client's problem (400, retrying is pointless); anything
+// else is a temporary 503.
+func proxyErrorStatus(err error) int {
+	var noModel *NoEligibleModelError
+	if errors.As(err, &noModel) {
+		return http.StatusBadRequest
+	}
+	return http.StatusServiceUnavailable
 }
 
 // writeProxyError sends a real HTTP error status with an OpenAI-style error body.

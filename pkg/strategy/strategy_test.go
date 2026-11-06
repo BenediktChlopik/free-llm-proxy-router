@@ -301,14 +301,17 @@ func TestStrategyBalanced(t *testing.T) {
 	}
 }
 
-// TestRegistry13Strategies verifies all 13 strategies are registered.
-func TestRegistry13Strategies(t *testing.T) {
+// TestRegistryStrategies verifies all 15 strategies are registered.
+func TestRegistryStrategies(t *testing.T) {
 	relTracker := reliability.New()
 	rateLimiter := ratelimit.NewGlobalTracker()
 	reg := NewRegistry(relTracker, rateLimiter, "", "", 3, 5)
 	names := reg.Names()
-	if len(names) != 13 {
-		t.Errorf("registry has %d strategies, want 13: %v", len(names), names)
+	if len(names) != 15 {
+		t.Errorf("registry has %d strategies, want 15: %v", len(names), names)
+	}
+	if _, err := reg.Get("smart"); err != nil {
+		t.Errorf("smart not registered: %v", err)
 	}
 }
 

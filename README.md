@@ -135,10 +135,21 @@ Pass any strategy name as the `model` field, or set a default in `config.yaml`:
 | `coding` | Prefers models with code capability |
 | `tools` | Tool/function-calling models only (non-tool models are excluded, not just demoted) |
 | `long_context` | Highest context window first (Gemini 1M) |
+| `smart` | Largest model that safely fits the request: filters by context capacity and required capabilities (tools, vision), then ranks the eligible models largest first; fallback stays inside that set |
 | `similar` | Same model family as a reference model |
 | `parallel` | Sends requests to up to `fan_out` providers concurrently; first usable answer wins |
 | `reliable` | Highest success-rate providers first |
 | `economical` | Rate-limited free tiers before credit-based |
+
+### The `smart` strategy
+
+Goal: use the most capable model that safely fits the request, while keeping routing efficient and avoiding context-limit and tool-calling errors.
+
+1. **Filter first.** A model stays a candidate only if its context window holds the request — estimated prompt (messages *and* tool definitions) × `safety_margin`, plus the reply budget (`max_tokens`, or `output_reserve_tokens`) — and it supports what the request needs: tool calling when the request carries `tools`/`functions` or earlier tool calls, image input when it carries images. Models whose window the catalog does not know are assumed to hold `unknown_context_tokens` (8192) unless their name advertises a long context, so an unverified model is never trusted with a big prompt.
+2. **Then prioritise the largest eligible models.** Candidates are ordered by effective parameter count. Between equally large models, the one with provider-confirmed tool support wins for tool requests, then the one with the smaller sufficient context window, which keeps long-context models free for requests that need them.
+3. **Fallback follows the same rules.** The chain walks only this filtered list, and the `openrouter/free` last-resort router (which can pick any model) is skipped. If no free model qualifies, the proxy answers at once with HTTP 400 (`no_eligible_model`) explaining what was missing, instead of retrying a request that cannot succeed.
+
+Tune it under `proxy.strategy_overrides.smart` (see `configs/config.example.yaml`).
 
 ## Fallback chain
 
@@ -157,7 +168,7 @@ Definitive HTTP 402 and 404 model failures remove that model from the live and p
 and the blocklist prevents later scans from reintroducing it. Provider scans and probe checks
 run concurrently with bounded worker pools.
 
-**The request stays pending until a real provider answers.** `fallback.max_attempts` caps the provider calls in one pass over the chain; if a pass finds no working provider, the proxy waits (exponential backoff starting at 250ms by default (`retry_backoff_initial` → `retry_backoff_max`), with jitter, cut short when a cooldown expires) and starts another pass with the original request. The client only ever receives a genuine provider completion — never a synthetic one. A `200` response with no content (no text, tool calls or choices, or a non-JSON body) counts as a failed attempt: the proxy tries all other providers first and only asks the provider that returned the empty answer again after them. Streaming clients get SSE `: keep-alive` comments while waiting. To bound the wait, set `fallback.max_wait`; when it elapses the proxy returns HTTP 503 with an OpenAI-style `error` object (not a completion). A client that disconnects cancels the retries.
+**The request stays pending until a real provider answers.** `fallback.max_attempts` caps the provider calls in one pass over the chain; if a pass finds no working provider, the proxy waits (exponential backoff starting at 250ms by default (`retry_backoff_initial` → `retry_backoff_max`), with jitter, cut short when a cooldown expires) and starts another pass with the original request. The client only ever receives a genuine provider completion — never a synthetic one. A `200` response with no content (no text, tool calls or choices, or a non-JSON body) counts as a failed attempt: the proxy tries all other providers first and only asks the provider that returned the empty answer again after them. Streaming clients get SSE `: keep-alive` comments while waiting. To set the longest time a request may take to get an answer, set `fallback.max_wait` (e.g. `120s`). It is a hard cap on the whole request — provider calls still in flight are cut off, not waited for — and when it elapses the proxy returns HTTP 503 with an OpenAI-style `error` object (not a completion). `0s` (the default when the key is absent) means no limit. A client that disconnects cancels the retries.
 
 ## Supported providers
 
@@ -236,7 +247,7 @@ go vet ./...
 make build
 ```
 
-Tests cover: 30+ model name classifier cases, all 10 provider rate-limit header extractors, all 14 strategy `Rank()` methods.
+Tests cover: 30+ model name classifier cases, all 10 provider rate-limit header extractors, all 15 strategy `Rank()` methods.
 
 ## Acknowledgments
 

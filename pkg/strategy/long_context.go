@@ -39,17 +39,7 @@ func (s *StrategyLongContext) Rank(req Request, entries []catalog.CatalogEntry, 
 
 func longContextScore(e catalog.CatalogEntry, enriched *models.EnrichedCatalog) float64 {
 	// Use enriched context window if available
-	contextWindow := e.ContextWindow
-	if contextWindow == 0 && enriched != nil {
-		for _, em := range enriched.Models {
-			for _, inst := range em.Instances {
-				if inst.ProviderID == e.ProviderID && inst.ModelID == e.ModelID {
-					contextWindow = inst.ContextWindow
-					break
-				}
-			}
-		}
-	}
+	contextWindow := resolveContextWindow(e, enriched)
 
 	if contextWindow >= 1_000_000 {
 		return 1.0 // 1M+ context: top pick

@@ -103,10 +103,11 @@ type FallbackConfig struct {
 	// after every further failed pass up to RetryBackoffMax (with jitter).
 	RetryBackoffInitial time.Duration `mapstructure:"retry_backoff_initial"`
 	RetryBackoffMax     time.Duration `mapstructure:"retry_backoff_max"`
-	// MaxWait bounds how long one request may stay pending. 0 (default) means
-	// no limit: the request is retried until a provider answers or the client
-	// disconnects. When set and exceeded, the proxy answers with a 503 error,
-	// never with a fabricated completion.
+	// MaxWait is the longest a request may take to get an answer: a hard cap on
+	// the whole request, including provider calls already in flight, retries and
+	// backoff waits. 0 (default) means no limit: the request is retried until a
+	// provider answers or the client disconnects. When it elapses, the proxy
+	// answers with a 503 error, never with a fabricated completion.
 	MaxWait time.Duration `mapstructure:"max_wait"`
 }
 
