@@ -26,16 +26,9 @@ proxy:
   auth_token: ""       # Set to require a Bearer token on incoming requests
   cache_ttl: 300       # Response cache TTL in seconds (0 to disable)
   log_level: "info"
-  strategy: "adaptive" # Default strategy: adaptive, performance, speed, volume, balanced,
-                        # small, tiny, coding, tools, long_context, smart, similar, parallel,
-                        # reliable, economical
+  strategy: "smart"    # Only strategy: smart routing (filters by context fit and capabilities)
 
   strategy_overrides:
-    performance:   { max_tokens_cap: 2048 }
-    small:         { max_tokens_cap: 256 }
-    tiny:          { max_tokens_cap: 128 }
-    speed:         { max_tokens_cap: 512 }
-    parallel:      { fan_out: 3 }
     # smart: filters by context fit and required capabilities (tools, vision), then
     # takes the largest eligible model. Every setting is optional:
     #   safety_margin           multiplier on the estimated prompt size (token counts are rough)
@@ -43,9 +36,6 @@ proxy:
     #   unknown_context_tokens  window assumed for models whose context size is not in the catalog
     #   max_tokens_cap          cap applied to max_tokens (the fit check uses it as the reply budget)
     smart:         { safety_margin: 1.15, output_reserve_tokens: 1024, unknown_context_tokens: 8192 }
-
-  similar:
-    model_family: "llama-3.1-70b"
 
   # Agent profiles: let named AI agents use different routing strategies.
   # An agent sends model: "<profile-name>" to select a profile.

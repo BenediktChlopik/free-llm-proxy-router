@@ -294,7 +294,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("proxy.port", 8080)
 	v.SetDefault("proxy.cache_ttl", 300)
 	v.SetDefault("proxy.log_level", "info")
-	v.SetDefault("proxy.strategy", "adaptive")
+	v.SetDefault("proxy.strategy", "smart")
 	v.SetDefault("catalog.path", expandHome("~/.free-llm-proxy-router/catalog.json"))
 	v.SetDefault("catalog.enriched_path", expandHome("~/.free-llm-proxy-router/enriched.json"))
 	v.SetDefault("catalog.max_age_hours", 24)

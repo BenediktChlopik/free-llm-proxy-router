@@ -381,8 +381,7 @@ func (s *Server) executeStrategyChain(w http.ResponseWriter, r *http.Request, cf
 
 	strat, err := s.strategyReg.Get(stratName)
 	if err != nil {
-		log.Printf("unknown strategy %q, falling back to adaptive", stratName)
-		strat, _ = s.strategyReg.Get("adaptive")
+		log.Printf("unknown strategy %q (smart is the only strategy)", stratName)
 	}
 
 	chain := &FallbackChain{

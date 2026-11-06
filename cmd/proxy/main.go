@@ -24,9 +24,8 @@ import (
 )
 
 var (
-	cfgFile   string
-	port      int
-	stratName string
+	cfgFile string
+	port    int
 )
 
 func main() {
@@ -37,7 +36,6 @@ func main() {
 	}
 	root.Flags().StringVarP(&cfgFile, "config", "c", "", "config file path (default: search in . and ~/.free-llm-proxy-router/)")
 	root.Flags().IntVarP(&port, "port", "p", 0, "override proxy port (default from config: 8080)")
-	root.Flags().StringVarP(&stratName, "strategy", "s", "", "override strategy name")
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -53,9 +51,6 @@ func runProxy(cmd *cobra.Command, args []string) error {
 	}
 	if port > 0 {
 		cfg.Proxy.Port = port
-	}
-	if stratName != "" {
-		cfg.Proxy.Strategy = stratName
 	}
 
 	// Load model catalog
@@ -125,26 +120,7 @@ func runProxy(cmd *cobra.Command, args []string) error {
 	}
 
 	// Set up strategy registry
-	similarFamily := ""
-	if cfg.Proxy.Similar != nil {
-		similarFamily = cfg.Proxy.Similar["model_family"]
-	}
-	geminiPreferred := ""
-	for _, p := range cfg.Providers {
-		if p.ID == "gemini" {
-			geminiPreferred = p.PreferredVolumeModel
-		}
-	}
-	fanOut := 3
-	if cfg.Proxy.StrategyOverrides != nil {
-		if pOv, ok := cfg.Proxy.StrategyOverrides["parallel"]; ok {
-			if fo, ok := pOv["fan_out"].(int); ok {
-				fanOut = fo
-			}
-		}
-	}
-
-	stratReg := strategy.NewRegistry(reliabilityTracker, rateLimiter, similarFamily, geminiPreferred, fanOut, 5)
+	stratReg := strategy.NewRegistry()
 
 	// Create server
 	srv := proxy.NewServer(cfg, cat, stratReg, rateLimiter, geminiTracker, reliabilityTracker)

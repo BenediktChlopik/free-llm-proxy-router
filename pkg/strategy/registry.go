@@ -12,37 +12,13 @@ type Registry struct {
 	strategies map[string]Strategy
 }
 
-// NewRegistry creates a Registry with all 15 strategies pre-registered.
-// Pass the dependency objects needed by stateful strategies.
-func NewRegistry(
-	reliabilityTracker *reliability.Tracker,
-	globalRateTracker *ratelimit.GlobalTracker,
-	similarFamily string,
-	geminiPreferredModel string,
-	parallelFanOut int,
-	orFallbackN int,
-) *Registry {
+// NewRegistry creates a Registry with only the smart strategy.
+func NewRegistry() *Registry {
 	r := &Registry{strategies: make(map[string]Strategy)}
 
+	// Only smart strategy is enabled - it's the default and only strategy.
 	strategies := []Strategy{
-		&StrategyPerformance{},
-		&StrategySpeed{},
-		&StrategyVolume{GeminiPreferredModel: geminiPreferredModel},
-		&StrategyBalanced{},
-		&StrategySmall{GlobalTracker: globalRateTracker},
-		&StrategyTiny{},
-		&StrategyCoding{},
-		&StrategyTools{},
-		&StrategyLongContext{},
 		&StrategySmart{},
-		&StrategySimilar{TargetFamily: similarFamily},
-		&StrategyParallel{FanOut: parallelFanOut},
-		&StrategyReliable{Tracker: reliabilityTracker},
-		&StrategyEconomical{},
-		&StrategyAdaptive{
-			Tracker:                   reliabilityTracker,
-			OpenRouterNativeFallbackN: orFallbackN,
-		},
 	}
 
 	for _, s := range strategies {
