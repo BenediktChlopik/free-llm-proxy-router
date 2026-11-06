@@ -14,19 +14,6 @@ func IsStale(path string, maxAge time.Duration) bool {
 	return time.Since(info.ModTime()) > maxAge
 }
 
-// NeedsEnrichment returns true if the enriched catalog is missing or older than
-// the catalog file (i.e. the catalog was updated more recently).
-func NeedsEnrichment(catalogPath, enrichedPath string) bool {
-	catInfo, err := os.Stat(expandHome(catalogPath))
-	if err != nil {
-		return false // no catalog yet — nothing to enrich
-	}
-	enrichedInfo, err := os.Stat(expandHome(enrichedPath))
-	if err != nil {
-		return true // enriched missing
-	}
-	return catInfo.ModTime().After(enrichedInfo.ModTime())
-}
 
 // PendingReverification returns the list of model IDs (per provider) that need
 // re-verification after unexpected 429s.

@@ -31,41 +31,5 @@ type EnrichedCatalog struct {
 	Models    []EnrichedModel `json:"models"`
 }
 
-// FindByProvider returns all instances for a given provider ID.
-func (ec *EnrichedCatalog) FindByProvider(providerID string) []EnrichedModel {
-	var out []EnrichedModel
-	for _, m := range ec.Models {
-		for _, inst := range m.Instances {
-			if inst.ProviderID == providerID {
-				out = append(out, m)
-				break
-			}
-		}
-	}
-	return out
-}
 
-// FindByTier returns all enriched models at the given tier.
-func (ec *EnrichedCatalog) FindByTier(tier ModelTier) []EnrichedModel {
-	var out []EnrichedModel
-	for _, m := range ec.Models {
-		if m.Tier == tier {
-			out = append(out, m)
-		}
-	}
-	return out
-}
 
-// FindByCapability returns all enriched models that have the given capability.
-func (ec *EnrichedCatalog) FindByCapability(cap Capability) []EnrichedModel {
-	var out []EnrichedModel
-	for _, m := range ec.Models {
-		for _, c := range m.Capabilities {
-			if c == cap {
-				out = append(out, m)
-				break
-			}
-		}
-	}
-	return out
-}

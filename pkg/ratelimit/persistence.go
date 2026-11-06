@@ -43,23 +43,7 @@ func LoadUsage(path string) (*UsageSnapshot, error) {
 	return &u, nil
 }
 
-// SaveUsage atomically writes a UsageSnapshot to the given path.
-func SaveUsage(u *UsageSnapshot, path string) error {
-	expanded := expandHome(path)
-	if err := os.MkdirAll(filepath.Dir(expanded), 0o755); err != nil {
-		return fmt.Errorf("creating usage dir: %w", err)
-	}
-	u.SavedAt = time.Now()
-	data, err := json.MarshalIndent(u, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encoding usage: %w", err)
-	}
-	tmp := expanded + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return fmt.Errorf("writing usage tmp: %w", err)
-	}
-	return os.Rename(tmp, expanded)
-}
+
 
 func expandHome(path string) string {
 	if len(path) >= 2 && path[:2] == "~/" {
