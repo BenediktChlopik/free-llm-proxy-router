@@ -5,7 +5,6 @@ import (
 
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/catalog"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/models"
-	"github.com/kaiser-data/free-llm-proxy-router/pkg/ratelimit"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/reliability"
 )
 
@@ -40,10 +39,8 @@ func testReq() Request {
 func TestAllStrategiesReturnResults(t *testing.T) {
 	entries := testEntries()
 	req := testReq()
-	relTracker := reliability.New()
-	rateLimiter := ratelimit.NewGlobalTracker()
 
-	reg := NewRegistry(relTracker, rateLimiter, "llama-3.1", "gemini-2.0-flash-lite", 3, 5)
+	reg := NewRegistry()
 
 	for _, name := range reg.Names() {
 		t.Run(name, func(t *testing.T) {
@@ -301,14 +298,12 @@ func TestStrategyBalanced(t *testing.T) {
 	}
 }
 
-// TestRegistryStrategies verifies all 15 strategies are registered.
+// TestRegistryStrategies verifies the registry exposes only the smart strategy.
 func TestRegistryStrategies(t *testing.T) {
-	relTracker := reliability.New()
-	rateLimiter := ratelimit.NewGlobalTracker()
-	reg := NewRegistry(relTracker, rateLimiter, "", "", 3, 5)
+	reg := NewRegistry()
 	names := reg.Names()
-	if len(names) != 15 {
-		t.Errorf("registry has %d strategies, want 15: %v", len(names), names)
+	if len(names) != 1 {
+		t.Errorf("registry has %d strategies, want 1: %v", len(names), names)
 	}
 	if _, err := reg.Get("smart"); err != nil {
 		t.Errorf("smart not registered: %v", err)

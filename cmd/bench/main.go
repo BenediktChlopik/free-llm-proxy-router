@@ -13,8 +13,6 @@ import (
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/bench"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/catalog"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/config"
-	"github.com/kaiser-data/free-llm-proxy-router/pkg/reliability"
-	"github.com/kaiser-data/free-llm-proxy-router/pkg/ratelimit"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/strategy"
 )
 
@@ -51,10 +49,7 @@ func runBench(cmd *cobra.Command, args []string) error {
 	}
 
 	// Build all strategies
-	relTracker := reliability.New()
-	reliability.Load(relTracker, "~/.free-llm-proxy-router/reliability.json")
-	rateLimiter := ratelimit.NewGlobalTracker()
-	stratReg := strategy.NewRegistry(relTracker, rateLimiter, "", "gemini-2.0-flash-lite", 3, 5)
+	stratReg := strategy.NewRegistry()
 
 	var strategies []strategy.Strategy
 	for _, name := range stratReg.Names() {

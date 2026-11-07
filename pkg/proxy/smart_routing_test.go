@@ -236,7 +236,7 @@ func TestExecute_ClientDisconnectStillBeatsMaxWait(t *testing.T) {
 
 // chatServer is a Server wired to a catalog and the real strategy registry.
 func chatServer(cfg *config.Config, entries []catalog.CatalogEntry) *Server {
-	reg := strategy.NewRegistry(reliability.New(), ratelimit.NewGlobalTracker(), "", "", 3, 5)
+	reg := strategy.NewRegistry()
 	return NewServer(cfg, &catalog.Catalog{Entries: entries}, reg, ratelimit.NewGlobalTracker(), nil, reliability.New())
 }
 

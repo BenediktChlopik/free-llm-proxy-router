@@ -79,6 +79,11 @@ func (d *Dispatcher) ScanAll(ctx context.Context, providers []config.ProviderCon
 					continue
 				}
 				if !job.provider.IsEnabled() {
+					if job.provider.APIKeyEnv != "" {
+						log.Printf("scan: skipping %s — no API key (set %s in .env, or use --all-providers)", job.provider.ID, job.provider.APIKeyEnv)
+					} else {
+						log.Printf("scan: skipping %s — disabled (use --all-providers to scan anyway)", job.provider.ID)
+					}
 					continue
 				}
 				scanner := d.scannerFor(job.provider.ID)

@@ -145,9 +145,21 @@ func Load(path string) (*Config, error) {
 	v.AutomaticEnv()
 
 	if err := v.ReadInConfig(); err != nil {
-		// Config file is optional — use defaults if not found.
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
 			return nil, fmt.Errorf("reading config: %w", err)
+		}
+		// No config.yaml anywhere: fall back to the shipped example so the
+		// provider list isn't silently empty (which makes scans find nothing).
+		if path == "" {
+			for _, ex := range []string{"configs/config.example.yaml", "config.example.yaml"} {
+				if _, statErr := os.Stat(ex); statErr == nil {
+					v.SetConfigFile(ex)
+					if rerr := v.ReadInConfig(); rerr == nil {
+						log.Printf("config: no config.yaml found; using %s (copy it to ~/.free-llm-proxy-router/config.yaml to customize)", ex)
+						break
+					}
+				}
+			}
 		}
 	}
 
