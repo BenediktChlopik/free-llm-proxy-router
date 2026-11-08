@@ -100,6 +100,14 @@ fallback:
   # provider calls that are still running. When it elapses the client gets HTTP 503
   # (an error, never a made-up completion). 0s = wait indefinitely.
   max_wait: 120s
+  # Fast fallback. A provider that fails (429, 5xx, transport error) is replaced
+  # by the next candidate immediately. A provider that is merely *slow* is
+  # hedged: after hedge_after of silence the next-best candidate starts
+  # alongside it, the first usable completion wins and the other call is
+  # cancelled. Costs at most hedge_max_inflight requests of free-tier quota per
+  # request. 0s = no hedging (strictly one candidate after another).
+  hedge_after: 2s
+  hedge_max_inflight: 2
   # Cerebras-specific: add spacing between requests to avoid RPS spikes
   cerebras_request_spacing_ms: 100
 

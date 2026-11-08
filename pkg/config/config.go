@@ -109,6 +109,16 @@ type FallbackConfig struct {
 	// provider answers or the client disconnects. When it elapses, the proxy
 	// answers with a 503 error, never with a fabricated completion.
 	MaxWait time.Duration `mapstructure:"max_wait"`
+	// HedgeAfter is how long an in-flight provider call may stay silent before
+	// the chain starts the next-best candidate *alongside* it (the slow call is
+	// not cancelled). The first usable completion wins and the rest are
+	// cancelled. Failures (429, 5xx, transport errors) never wait for this: the
+	// next candidate starts the moment one fails. 0 disables hedging, so
+	// candidates are then tried strictly one after another.
+	HedgeAfter time.Duration `mapstructure:"hedge_after"`
+	// HedgeMaxInflight caps how many provider calls of one request may be in
+	// flight at once (default 2), bounding the free-tier quota spent on hedges.
+	HedgeMaxInflight int `mapstructure:"hedge_max_inflight"`
 }
 
 // mu guards the current config pointer for concurrent hot-reload.
@@ -317,6 +327,8 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("fallback.retry_backoff_initial", "250ms")
 	v.SetDefault("fallback.retry_backoff_max", "2s")
 	v.SetDefault("fallback.max_wait", "0s")
+	v.SetDefault("fallback.hedge_after", "2s")
+	v.SetDefault("fallback.hedge_max_inflight", 2)
 	v.SetDefault("refresh.schedule", "weekly")
 	v.SetDefault("refresh.output_merge", "conservative")
 }

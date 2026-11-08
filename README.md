@@ -168,6 +168,8 @@ Definitive HTTP 402 and 404 model failures remove that model from the live and p
 and the blocklist prevents later scans from reintroducing it. Provider scans and probe checks
 run concurrently with bounded worker pools.
 
+**Fastest possible fallback.** A provider that *fails* (429, 5xx, transport error, empty completion) is replaced by the next candidate the instant the failure arrives — nothing waits. A provider that is merely *slow* is **hedged**: after `fallback.hedge_after` (default `2s`) of silence the next-best candidate is started *alongside* it, the first usable completion wins, and the other call is cancelled. The slow call is not killed when the hedge starts, so a model that is just slow still wins if it answers first. `fallback.hedge_max_inflight` (default `2`) caps how many calls one request may have in flight, which bounds the free-tier quota a hedge can spend. Set `hedge_after: 0s` to go back to strictly one candidate at a time.
+
 **The request stays pending until a real provider answers.** `fallback.max_attempts` caps the provider calls in one pass over the chain; if a pass finds no working provider, the proxy immediately starts another pass (no backoff; it only pauses ~100ms if a pass made no provider call at all, e.g. everything is on cooldown) and starts another pass with the original request. The client only ever receives a genuine provider completion — never a synthetic one. A `200` response with no content (no text, tool calls or choices, or a non-JSON body) counts as a failed attempt: the proxy tries all other providers first and only asks the provider that returned the empty answer again after them. Streaming clients get SSE `: keep-alive` comments while waiting. To set the longest time a request may take to get an answer, set `fallback.max_wait` (e.g. `120s`). It is a hard cap on the whole request — provider calls still in flight are cut off, not waited for — and when it elapses the proxy returns HTTP 503 with an OpenAI-style `error` object (not a completion). `0s` (the default when the key is absent) means no limit. A client that disconnects cancels the retries.
 
 ## Supported providers
@@ -191,6 +193,8 @@ All providers have recharging free limits — no one-time trial credits, no cred
 
 Config is loaded from `~/.free-llm-proxy-router/config.yaml` (created by `setup.sh`).
 Hot-reloaded via fsnotify — no restart needed when you save the file.
+
+The model catalog (`catalog.json`) is hot-reloaded the same way, about 40 ms after the file is replaced. Rewriting identical content is ignored, and a half-written or missing file is skipped so the active catalog is never lost.
 
 ```bash
 bash scripts/setup.sh   # First-time setup
