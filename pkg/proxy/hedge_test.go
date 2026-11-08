@@ -217,3 +217,49 @@ func TestHedge_LoserFailureEffectsAreApplied(t *testing.T) {
 		t.Error("404 model should have been excluded from the catalog")
 	}
 }
+
+// A model that is known to answer fast is hedged sooner than the configured
+// hedge_after, and a model of unknown speed is not.
+func TestHedgeDelayFor_ShortensForFastModels(t *testing.T) {
+	p := newHedgeProvider(t, "m", 0, http.StatusOK)
+	fc := newHedgeChain(2*time.Second, 2, p)
+	a := attempt{r: strategy.RankedEntry{ProviderID: "m", ModelID: "m"}}
+
+	if got := fc.hedgeDelayFor(a); got != 2*time.Second {
+		t.Errorf("unknown model delay = %v, want the full 2s", got)
+	}
+	fc.ReliabilityTracker.RecordCall("m", "m", true, 400*time.Millisecond)
+	if got := fc.hedgeDelayFor(a); got != time.Second {
+		t.Errorf("fast model delay = %v, want 2.5 x 400ms = 1s", got)
+	}
+	fc.ReliabilityTracker.RecordCall("m", "m", true, 60*time.Millisecond)
+	fc.ReliabilityTracker.RecordCall("m", "m", true, 60*time.Millisecond)
+	fc.ReliabilityTracker.RecordCall("m", "m", true, 60*time.Millisecond)
+	fc.ReliabilityTracker.RecordCall("m", "m", true, 60*time.Millisecond)
+	if got := fc.hedgeDelayFor(a); got < minHedgeDelay {
+		t.Errorf("delay = %v, must never go below %v", got, minHedgeDelay)
+	}
+	fc.ReliabilityTracker.RecordCall("m", "m", true, 30*time.Second)
+	fc.ReliabilityTracker.RecordCall("m", "m", true, 30*time.Second)
+	fc.ReliabilityTracker.RecordCall("m", "m", true, 30*time.Second)
+	if got := fc.hedgeDelayFor(a); got != 2*time.Second {
+		t.Errorf("slow model delay = %v, must be capped at hedge_after", got)
+	}
+}
+
+// Finished calls feed the tracker, so the next request ranks by what was seen.
+func TestExecute_RecordsPerModelPerformance(t *testing.T) {
+	good := newHedgeProvider(t, "good", 20*time.Millisecond, http.StatusOK)
+	bad := newHedgeProvider(t, "bad", 0, http.StatusInternalServerError)
+	fc := newHedgeChain(0, 2, bad, good)
+
+	if _, err := fc.executePass(context.Background(), hedgeReq(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if lat, succ, calls := fc.ReliabilityTracker.Perf("good", "good"); calls != 1 || succ != 1 || lat < 15 {
+		t.Errorf("good: lat=%v success=%v calls=%d", lat, succ, calls)
+	}
+	if _, succ, calls := fc.ReliabilityTracker.Perf("bad", "bad"); calls != 1 || succ >= 1 {
+		t.Errorf("bad: success=%v calls=%d, want a recorded failure", succ, calls)
+	}
+}

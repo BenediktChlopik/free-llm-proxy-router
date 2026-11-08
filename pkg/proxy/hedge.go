@@ -24,8 +24,36 @@ type attempt struct {
 // attemptResult is the outcome of an attempt, delivered over a channel.
 type attemptResult struct {
 	attempt
-	resp *Response
-	err  error
+	resp    *Response
+	err     error
+	elapsed time.Duration // wall time of the call
+}
+
+// minHedgeDelay is the earliest a hedge may start, however fast the model
+// usually is: below this a normal response time jitter would trigger hedges.
+const minHedgeDelay = 250 * time.Millisecond
+
+// hedgeDelayFor is how long to wait on attempt a before starting the next
+// candidate. It is Fallback.HedgeAfter at most, shortened for models known to
+// answer quickly: 2.5x their typical latency, so a model that usually takes
+// 400ms is hedged after 1s, not after the full HedgeAfter.
+func (fc *FallbackChain) hedgeDelayFor(a attempt) time.Duration {
+	d := fc.Cfg.Fallback.HedgeAfter
+	if d <= 0 || a.native || fc.ReliabilityTracker == nil {
+		return d
+	}
+	latencyMs, _, calls := fc.ReliabilityTracker.Perf(a.r.ProviderID, a.r.ModelID)
+	if calls == 0 || latencyMs <= 0 {
+		return d
+	}
+	adaptive := time.Duration(latencyMs * 2.5 * float64(time.Millisecond))
+	if adaptive < minHedgeDelay {
+		adaptive = minHedgeDelay
+	}
+	if adaptive < d {
+		return adaptive
+	}
+	return d
 }
 
 // runCandidates walks the strategy's ranked candidates and returns the first
@@ -49,6 +77,7 @@ type attemptResult struct {
 // means no candidate answered in this pass.
 func (fc *FallbackChain) runCandidates(ctx context.Context, req Request, stratReq strategy.Request, ranked []strategy.RankedEntry, maxAttempts int, demoted map[string]bool) (*Response, int, error) {
 	hedgeAfter := fc.Cfg.Fallback.HedgeAfter
+	var lastLaunched attempt // the newest call; its typical latency sets the hedge timer
 	maxInflight := fc.Cfg.Fallback.HedgeMaxInflight
 	if maxInflight <= 0 {
 		maxInflight = 2
@@ -66,9 +95,11 @@ func (fc *FallbackChain) runCandidates(ctx context.Context, req Request, stratRe
 	launch := func(a attempt) {
 		inflight++
 		inflightProviders[a.r.ProviderID] = true
+		lastLaunched = a
 		go func() {
+			start := time.Now()
 			resp, err := fc.callProvider(raceCtx, a.cfg, a.body)
-			results <- attemptResult{attempt: a, resp: resp, err: err}
+			results <- attemptResult{attempt: a, resp: resp, err: err, elapsed: time.Since(start)}
 		}()
 	}
 	received := func(res attemptResult) {
@@ -83,7 +114,7 @@ func (fc *FallbackChain) runCandidates(ctx context.Context, req Request, stratRe
 	wait := func(hedge bool) (attemptResult, bool, error) {
 		var timer <-chan time.Time
 		if hedge && hedgeAfter > 0 && inflight < maxInflight {
-			t := time.NewTimer(hedgeAfter)
+			t := time.NewTimer(fc.hedgeDelayFor(lastLaunched))
 			defer t.Stop()
 			timer = t.C
 		}
@@ -145,6 +176,14 @@ func (fc *FallbackChain) runCandidates(ctx context.Context, req Request, stratRe
 			fc.noteOpenRouterFailure(resp, res.sent)
 			fc.ReliabilityTracker.Record("openrouter", false)
 			return nil, false, nil
+		}
+
+		// Teach the ranking how this model performs: fast successes move it up,
+		// failures and empty answers move it down. A call cut short because the
+		// request itself ended says nothing about the model.
+		if ctx.Err() == nil {
+			ok := callErr == nil && resp.StatusCode == http.StatusOK && !resp.Empty
+			fc.ReliabilityTracker.RecordCall(r.ProviderID, r.ModelID, ok, res.elapsed)
 		}
 
 		if callErr == nil && resp.StatusCode == http.StatusOK && resp.Empty {
@@ -227,7 +266,7 @@ func (fc *FallbackChain) runCandidates(ctx context.Context, req Request, stratRe
 			return nil, true, werr
 		}
 		if !got {
-			logging.Debug("fallback: no answer after %s — hedging with the next candidate", hedgeAfter)
+			logging.Debug("fallback: no answer from %s/%s after %s — hedging with the next candidate", lastLaunched.r.ProviderID, lastLaunched.r.ModelID, fc.hedgeDelayFor(lastLaunched))
 			return nil, false, nil
 		}
 		return process(res)

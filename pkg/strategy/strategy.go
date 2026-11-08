@@ -6,6 +6,11 @@ import (
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/models"
 )
 
+// PerfLookup reports how a model has been performing so far: typical response
+// time in ms (0 = never measured), success rate 0–1, and the number of calls
+// behind them. Strategies that care about speed or reliability use it.
+type PerfLookup func(providerID, modelID string) (latencyMs, successRate float64, calls int64)
+
 // Request holds the information needed to rank models.
 type Request struct {
 	// Messages is the list of messages in the chat request.
@@ -24,6 +29,9 @@ type Request struct {
 	NeedsTools bool
 	// NeedsVision is set when the request carries image content.
 	NeedsVision bool
+	// Perf, when set, gives observed latency and success per model. nil means
+	// no history is available and strategies rank on static data alone.
+	Perf PerfLookup
 	// Options holds the strategy's proxy.strategy_overrides.<name> settings.
 	Options map[string]any
 }

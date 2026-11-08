@@ -24,11 +24,19 @@ import (
 //     Models that fail are removed, not demoted — the fallback chain never
 //     reaches them.
 //
-//  2. Rank. The surviving candidates are ordered largest first (effective
-//     parameters). Among equally large models, the one with provider-confirmed
-//     tool support comes first for tool requests, then the one with the smaller
-//     sufficient context window, which keeps long-context models free for the
-//     requests that actually need them.
+//  2. Rank. The surviving candidates are ordered by size (effective
+//     parameters) adjusted for how they have actually performed: each doubling
+//     of a model's typical response time costs speed_weight "size doublings"
+//     (a model must be about twice as large to justify answering twice as
+//     slowly), and a poor success rate costs failure_weight x (1 - rate). So a
+//     fast, reliable model beats a bigger one that is slow or often failing.
+//     Models never measured get a mild latency penalty, which lets measured
+//     fast models lead while untried ones remain fallback candidates. Failure
+//     records fade over ~30 minutes, so a demoted model is retried later.
+//     Without history the order is purely by size. Among models that score
+//     the same, the one with provider-confirmed tool support comes first for
+//     tool requests, then the one with the smaller sufficient context window,
+//     which keeps long-context models free for the requests that need them.
 //
 // During fallback the proxy walks this same list, so every retry candidate meets
 // the same requirements as the first choice. StrategySmart is Strict: it never
@@ -41,6 +49,10 @@ import (
 //	output_reserve_tokens  reply budget when the client sets no max_tokens (default 1024)
 //	unknown_context_tokens window assumed when the catalog has none (default 8192)
 //	max_tokens_cap         same cap the proxy applies to the request, so the reply budget matches
+//	speed_weight           size doublings charged per doubling of latency (default 1; 0 ignores speed)
+//	failure_weight         size doublings charged for a 0% success rate (default 6; 0 ignores failures)
+//	unknown_latency_ms     latency assumed for never-measured models (default 1000)
+//	fast_latency_ms        latency at or below which no speed penalty applies (default 500)
 type StrategySmart struct{}
 
 func (s *StrategySmart) Name() string { return "smart" }
@@ -49,6 +61,10 @@ const (
 	defaultSafetyMargin   = 1.15
 	defaultOutputReserve  = 1024
 	defaultUnknownContext = 8192
+	defaultSpeedWeight    = 1.0
+	defaultFailureWeight  = 6.0
+	defaultUnknownLatency = 1000.0
+	defaultFastLatency    = 500.0
 	longContextNameHint   = 131072 // window assumed for names that advertise long context
 	unknownParamsBillions = 30.0   // models with no parseable size rank as mid-sized
 )
@@ -57,6 +73,7 @@ const (
 type smartCandidate struct {
 	entry          catalog.CatalogEntry
 	size           float64 // effective parameters, billions
+	score          float64 // log2(size) minus speed and failure penalties; higher ranks first
 	window         int     // context window used for the fit check
 	confirmedTools bool    // provider says the model supports tools
 }
@@ -72,11 +89,14 @@ type smartTally struct {
 
 func (s *StrategySmart) Rank(req Request, entries []catalog.CatalogEntry, enriched *models.EnrichedCatalog) []RankedEntry {
 	cands, _ := smartFilter(req, entries, enriched)
+	for i := range cands {
+		cands[i].score = smartScore(req, cands[i])
+	}
 
 	sort.SliceStable(cands, func(i, j int) bool {
 		a, b := cands[i], cands[j]
-		if a.size != b.size {
-			return a.size > b.size // largest first
+		if math.Abs(a.score-b.score) > 1e-9 {
+			return a.score > b.score // best first
 		}
 		if req.NeedsTools && a.confirmedTools != b.confirmedTools {
 			return a.confirmedTools
@@ -90,10 +110,34 @@ func (s *StrategySmart) Rank(req Request, entries []catalog.CatalogEntry, enrich
 			Entry:      c.entry,
 			ProviderID: c.entry.ProviderID,
 			ModelID:    c.entry.ModelID,
-			Score:      -c.size,
+			Score:      -c.score,
 		})
 	}
 	return ranked
+}
+
+// smartScore is log2 of the model size, less penalties for slowness and
+// failures when performance history is available.
+func smartScore(req Request, c smartCandidate) float64 {
+	score := math.Log2(c.size)
+	if req.Perf == nil {
+		return score
+	}
+	latency, success, calls := req.Perf(c.entry.ProviderID, c.entry.ModelID)
+	fast := optFloat(req.Options, "fast_latency_ms", defaultFastLatency)
+	if fast < 1 {
+		fast = defaultFastLatency
+	}
+	if calls == 0 || latency <= 0 {
+		latency = optFloat(req.Options, "unknown_latency_ms", defaultUnknownLatency)
+	}
+	if latency > fast {
+		score -= optFloat(req.Options, "speed_weight", defaultSpeedWeight) * math.Log2(latency/fast)
+	}
+	if success < 1 {
+		score -= optFloat(req.Options, "failure_weight", defaultFailureWeight) * (1 - success)
+	}
+	return score
 }
 
 // Explain implements Strict.

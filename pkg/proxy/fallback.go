@@ -236,6 +236,9 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 		NeedsVision:           needsVision,
 		Options:               fc.Cfg.Proxy.StrategyOverrides[fc.Strategy.Name()],
 	}
+	if fc.ReliabilityTracker != nil {
+		stratReq.Perf = fc.ReliabilityTracker.Perf
+	}
 
 	// A strict strategy's ranked list is a hard filter: the chain stays inside
 	// it (no unfiltered last-resort router) and gives up at once if it is empty.
