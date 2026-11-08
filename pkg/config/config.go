@@ -99,8 +99,8 @@ type FallbackConfig struct {
 	// starts over until a provider answers.
 	MaxAttempts              int `mapstructure:"max_attempts"`
 	CerebrasRequestSpacingMs int `mapstructure:"cerebras_request_spacing_ms"`
-	// RetryBackoffInitial is the wait after the first failed pass; it doubles
-	// after every further failed pass up to RetryBackoffMax (with jitter).
+	// RetryBackoffInitial and RetryBackoffMax are deprecated and ignored: failed
+	// passes are now retried immediately, without backoff.
 	RetryBackoffInitial time.Duration `mapstructure:"retry_backoff_initial"`
 	RetryBackoffMax     time.Duration `mapstructure:"retry_backoff_max"`
 	// MaxWait is the longest a request may take to get an answer: a hard cap on

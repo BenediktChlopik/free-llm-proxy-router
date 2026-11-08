@@ -90,13 +90,11 @@ type NoEligibleModelError struct {
 
 func (e *NoEligibleModelError) Error() string { return e.Reason }
 
-const (
-	defaultBackoffInitial = 250 * time.Millisecond
-	defaultBackoffMax     = 2 * time.Second
-	// minRetryDelay keeps a pass that ends right before a cooldown expires
-	// from turning into a busy loop.
-	minRetryDelay = 100 * time.Millisecond
-)
+// minRetryDelay is the only wait between passes, and only when the pass that
+// just failed returned almost instantly (every candidate skipped on cooldown,
+// no provider call made). It keeps such a pass from turning into a busy loop.
+// A pass that actually called providers is followed by the next one at once.
+const minRetryDelay = 100 * time.Millisecond
 
 // Execute runs the fallback chain for the given request until a provider
 // returns a real response.
@@ -116,16 +114,6 @@ const (
 // A strict strategy that leaves no eligible model makes Execute return a
 // *NoEligibleModelError at once.
 func (fc *FallbackChain) Execute(parent context.Context, req Request) (*Response, error) {
-	backoff, backoffMax := fc.Cfg.Fallback.RetryBackoffInitial, fc.Cfg.Fallback.RetryBackoffMax
-	if backoff <= 0 {
-		backoff = defaultBackoffInitial
-	}
-	if backoffMax <= 0 {
-		backoffMax = defaultBackoffMax
-	}
-	if backoffMax < backoff {
-		backoffMax = backoff
-	}
 	maxWait := fc.Cfg.Fallback.MaxWait
 	deadline := req.deadline
 	if deadline.IsZero() && maxWait > 0 {
@@ -147,6 +135,7 @@ func (fc *FallbackChain) Execute(parent context.Context, req Request) (*Response
 
 	for pass := 1; ; pass++ {
 		logging.Debug("fallback: pass %d starting (max_wait=%s, max_attempts=%d)", pass, fc.Cfg.Fallback.MaxWait, fc.Cfg.Fallback.MaxAttempts)
+		passStart := time.Now()
 		resp, err := fc.executePass(ctx, req, demoted)
 		if err == nil {
 			logging.Info("fallback: success after %d pass(es)", pass)
@@ -160,7 +149,12 @@ func (fc *FallbackChain) Execute(parent context.Context, req Request) (*Response
 			return nil, err // no retry can make a model eligible
 		}
 
-		delay := fc.retryDelay(backoff)
+		// No backoff: a pass that made real provider calls is followed by the
+		// next pass immediately. Only an instant pass waits, to avoid spinning.
+		var delay time.Duration
+		if time.Since(passStart) < minRetryDelay {
+			delay = fc.retryDelay(minRetryDelay)
+		}
 		if !deadline.IsZero() {
 			remaining := time.Until(deadline)
 			if remaining <= 0 || ctx.Err() != nil {
@@ -170,22 +164,26 @@ func (fc *FallbackChain) Execute(parent context.Context, req Request) (*Response
 				delay = remaining
 			}
 		}
-		logging.Info("fallback: pass %d found no provider (%v) — retrying in %s", pass, err, delay.Round(time.Millisecond))
-		if serr := sleepCtx(ctx, delay); serr != nil {
+		logging.Info("fallback: pass %d found no provider (%v) — retrying", pass, err)
+		if delay > 0 {
+			if serr := sleepCtx(ctx, delay); serr != nil {
+				if cerr := parent.Err(); cerr != nil {
+					return nil, cerr
+				}
+				return nil, timedOut(pass, err)
+			}
+		} else if ctx.Err() != nil {
 			if cerr := parent.Err(); cerr != nil {
 				return nil, cerr
 			}
 			return nil, timedOut(pass, err)
 		}
-		if backoff *= 2; backoff > backoffMax {
-			backoff = backoffMax
-		}
 	}
 }
 
-// retryDelay turns the current backoff step into the actual wait: jittered ±20%
-// to avoid synchronised retries, and cut short when a provider/model cooldown
-// expires sooner so recovered capacity is picked up promptly.
+// retryDelay turns the base wait into the actual one: jittered ±20% to avoid
+// synchronised retries, and cut short when a provider/model cooldown expires
+// sooner (never below minRetryDelay).
 func (fc *FallbackChain) retryDelay(backoff time.Duration) time.Duration {
 	d := time.Duration(float64(backoff) * (0.8 + 0.4*rand.Float64()))
 	if fc.RateLimiter != nil {
