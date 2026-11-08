@@ -26,8 +26,8 @@ func BuildOpenRouterRequest(req map[string]any, freeModels []string) map[string]
 	if len(freeModels) == 0 {
 		return req
 	}
-	if len(freeModels) > maxOpenRouterFallbackModels {
-		freeModels = freeModels[:maxOpenRouterFallbackModels]
+	if limit := currentOpenRouterModelsLimit(); len(freeModels) > limit {
+		freeModels = freeModels[:limit]
 	}
 	body := copyMap(req)
 	body["model"] = freeModels[0]

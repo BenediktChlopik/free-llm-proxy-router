@@ -315,7 +315,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("fallback.max_attempts", 5)
 	v.SetDefault("fallback.cerebras_request_spacing_ms", 100)
 	v.SetDefault("fallback.retry_backoff_initial", "250ms")
-	v.SetDefault("fallback.retry_backoff_max", "30s")
+	v.SetDefault("fallback.retry_backoff_max", "2s")
 	v.SetDefault("fallback.max_wait", "0s")
 	v.SetDefault("refresh.schedule", "weekly")
 	v.SetDefault("refresh.output_merge", "conservative")

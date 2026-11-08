@@ -92,7 +92,7 @@ func (e *NoEligibleModelError) Error() string { return e.Reason }
 
 const (
 	defaultBackoffInitial = 250 * time.Millisecond
-	defaultBackoffMax     = 30 * time.Second
+	defaultBackoffMax     = 2 * time.Second
 	// minRetryDelay keeps a pass that ends right before a cooldown expires
 	// from turning into a busy loop.
 	minRetryDelay = 100 * time.Millisecond
@@ -275,8 +275,9 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 		return nil, fmt.Errorf("no provider answered in this parallel pass (%d candidates)", maxAttempts)
 	}
 
-	// Step 1: Try OpenRouter with models[] array (native fallback)
-	if or := fc.findProvider("openrouter"); or != nil {
+	// Step 1: Try OpenRouter with models[] array (native fallback). Skipped while
+	// OpenRouter's free quota is known to be exhausted.
+	if or := fc.findProvider("openrouter"); or != nil && !fc.RateLimiter.IsOnCooldown(openRouterCooldownKey) {
 		openRouterModels := fc.collectProviderModels("openrouter", ranked)
 		if len(openRouterModels) > 0 {
 			body := BuildOpenRouterRequest(req.Raw, openRouterModels)
@@ -286,6 +287,7 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 				return resp, nil
 			}
 			logging.Debug("fallback: openrouter models[] failed — continuing%s", upstreamErrSnippet(resp, err))
+			fc.noteOpenRouterFailure(resp, len(openRouterModels))
 			fc.ReliabilityTracker.Record("openrouter", false)
 		}
 	}
@@ -400,7 +402,25 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 			// model-specific: free tiers often fail one model (quota, retired,
 			// overloaded) while the provider's other models still answer.
 			modelLevel := resp != nil
+			accountLevel := false
 			if resp != nil {
+				switch classifyUpstreamFailure(resp) {
+				case failureNoCredit:
+					if resp.StatusCode != http.StatusPaymentRequired {
+						// e.g. Z.ai answers 429 / code 1113 for an empty balance: every
+						// model on this key fails, so retrying soon is pointless.
+						modelLevel, accountLevel = false, true
+						fc.RateLimiter.SetCooldown(r.ProviderID, time.Now().Add(noCreditCooldown))
+						logging.Warn("fallback: %s has no credit/resource package — cooldown %s", r.ProviderID, noCreditCooldown)
+					}
+				case failureUnsupportedModel:
+					// The model cannot serve this request shape (no tool support,
+					// not a chat model); stop picking it for a while.
+					fc.RateLimiter.SetCooldown(r.ProviderID+"/"+r.ModelID, time.Now().Add(unsupportedModelCooldown))
+					logging.Info("fallback: %s/%s cannot serve this request — model cooldown %s", r.ProviderID, r.ModelID, unsupportedModelCooldown)
+				}
+			}
+			if resp != nil && !accountLevel {
 				switch resp.StatusCode {
 				case 429:
 					fc.Catalog.MarkNeedsReverification(r.ProviderID, r.ModelID)
@@ -433,7 +453,7 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 			if resp != nil {
 				statusCode = resp.StatusCode
 			}
-						providerTries[r.ProviderID]++
+			providerTries[r.ProviderID]++
 			if modelLevel && providerTries[r.ProviderID] < maxModelsPerProvider {
 				// The provider itself is fine; try its next ranked model.
 				logging.Debug("fallback: %s/%s status %d — trying next model%s", r.ProviderID, r.ModelID, statusCode, upstreamErrSnippet(resp, err))
@@ -442,7 +462,7 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 			logging.Debug("fallback: %s/%s status %d — skipping provider%s", r.ProviderID, r.ModelID, statusCode, upstreamErrSnippet(resp, err))
 			// Model-level failures say nothing about the provider's health, so
 			// only auth and transport errors count against its reliability.
-			if !modelLevel {
+			if !modelLevel && !accountLevel {
 				fc.ReliabilityTracker.Record(r.ProviderID, false)
 				if fc.ReliabilityTracker.ShouldCooldown(r.ProviderID) {
 					fc.RateLimiter.SetCooldown(r.ProviderID, time.Now().Add(30*time.Second))
@@ -606,6 +626,23 @@ func (fc *FallbackChain) recordParallelFailure(result parallelResult) {
 		return
 	}
 	if resp != nil {
+		switch classifyUpstreamFailure(resp) {
+		case failureNoCredit:
+			if resp.StatusCode == http.StatusPaymentRequired {
+				fc.excludeModel(providerID, modelID)
+			} else if fc.RateLimiter != nil {
+				fc.RateLimiter.SetCooldown(providerID, time.Now().Add(noCreditCooldown))
+			}
+			return
+		case failureUnsupportedModel:
+			if fc.RateLimiter != nil {
+				fc.RateLimiter.SetCooldown(providerID+"/"+modelID, time.Now().Add(unsupportedModelCooldown))
+			}
+			return
+		case failureDailyLimit:
+			fc.noteOpenRouterFailure(resp, 0)
+			return
+		}
 		switch resp.StatusCode {
 		case http.StatusTooManyRequests:
 			if fc.Catalog != nil {
@@ -642,6 +679,26 @@ func (fc *FallbackChain) recordParallelFailure(result parallelResult) {
 	}
 }
 
+// noteOpenRouterFailure reacts to a failed OpenRouter native call: it parks
+// OpenRouter until the daily free quota resets, or shrinks the models[] array
+// when OpenRouter reports a stricter size limit. sent is the models[] length
+// that was sent (0 when not applicable).
+func (fc *FallbackChain) noteOpenRouterFailure(resp *Response, sent int) {
+	if resp == nil {
+		return
+	}
+	if classifyUpstreamFailure(resp) == failureDailyLimit && fc.RateLimiter != nil {
+		wait := openRouterResetWait(resp.Body)
+		fc.RateLimiter.SetCooldown(openRouterCooldownKey, time.Now().Add(wait))
+		logging.Warn("fallback: openrouter free-models-per-day quota exhausted — skipping OpenRouter for %s", wait.Round(time.Second))
+		return
+	}
+	if limit := modelsArrayLimit(resp); limit > 0 && sent > 0 {
+		n := lowerOpenRouterModelsLimit(sent, limit)
+		logging.Warn("fallback: openrouter rejected models[] of %d (limit %d) — using %d from now on", sent, limit, n)
+	}
+}
+
 func (fc *FallbackChain) excludeModel(providerID, modelID string) {
 	changed := false
 	if fc.Catalog != nil {
@@ -657,6 +714,10 @@ func (fc *FallbackChain) tryOpenRouterFree(ctx context.Context, req Request) (*R
 	if or == nil {
 		return nil, nil
 	}
+	if fc.RateLimiter != nil && fc.RateLimiter.IsOnCooldown(openRouterCooldownKey) {
+		logging.Debug("fallback: openrouter on cooldown — skipping openrouter/free")
+		return nil, nil
+	}
 	logging.Info("fallback: trying openrouter/free ultimate fallback")
 	resp, err := fc.callProvider(ctx, *or, OpenRouterFreeRouterRequest(req.Raw))
 	if err == nil && resp != nil && resp.usable() {
@@ -665,6 +726,7 @@ func (fc *FallbackChain) tryOpenRouterFree(ctx context.Context, req Request) (*R
 		}
 		return resp, nil
 	}
+	fc.noteOpenRouterFailure(resp, 0)
 	if fc.ReliabilityTracker != nil {
 		fc.ReliabilityTracker.Record("openrouter", false)
 	}
@@ -814,10 +876,11 @@ func (fc *FallbackChain) findProvider(id string) *config.ProviderConfig {
 
 func (fc *FallbackChain) collectProviderModels(providerID string, ranked []strategy.RankedEntry) []string {
 	var models []string
+	limit := currentOpenRouterModelsLimit()
 	for _, r := range ranked {
 		if r.ProviderID == providerID {
 			models = append(models, r.ModelID)
-			if len(models) == maxOpenRouterFallbackModels {
+			if len(models) == limit {
 				break
 			}
 		}
@@ -874,7 +937,7 @@ func (fc *FallbackChain) buildBody(providerID string, raw map[string]any, modelI
 	if pc := fc.findProvider(providerID); pc != nil && pc.NativeFeatures.ServiceTier != "" {
 		body["service_tier"] = pc.NativeFeatures.ServiceTier
 	}
-	return body
+	return sanitizeBody(providerID, body)
 }
 
 const (
