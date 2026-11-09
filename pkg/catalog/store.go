@@ -13,10 +13,6 @@ import (
 var mu sync.RWMutex
 
 // Load reads a Catalog from a JSON file.
-//
-// It takes no lock: Save replaces the file atomically (write tmp, rename), so a
-// reader always sees a complete old or new file. Holding mu here only made a
-// hot-reload wait behind an in-progress Save's JSON encoding.
 func Load(path string) (*Catalog, error) {
 	data, err := os.ReadFile(expandHome(path))
 	if err != nil {
@@ -47,7 +43,8 @@ func Save(c *Catalog, path string) error {
 		return fmt.Errorf("creating catalog dir: %w", err)
 	}
 
-	data, err := json.MarshalIndent(c, "", "  ")
+	// Use json.Marshal instead of json.MarshalIndent for speed.
+	data, err := json.Marshal(c)
 	if err != nil {
 		return fmt.Errorf("encoding catalog: %w", err)
 	}
@@ -85,7 +82,8 @@ func SaveEnriched(ec *models.EnrichedCatalog, path string) error {
 		return fmt.Errorf("creating enriched dir: %w", err)
 	}
 
-	data, err := json.MarshalIndent(ec, "", "  ")
+	// Use json.Marshal instead of json.MarshalIndent for speed.
+	data, err := json.Marshal(ec)
 	if err != nil {
 		return fmt.Errorf("encoding enriched catalog: %w", err)
 	}
