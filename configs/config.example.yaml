@@ -35,7 +35,7 @@ proxy:
     #   output_reserve_tokens   reply budget when the client sends no max_tokens
     #   unknown_context_tokens  window assumed for models whose context size is not in the catalog
     #   max_tokens_cap          cap applied to max_tokens (the fit check uses it as the reply budget)
-    smart:         { safety_margin: 1.15, output_reserve_tokens: 1024, unknown_context_tokens: 8192 }
+    smart:         { safety_margin: 1.15, output_reserve_tokens: 1024, unknown_context_tokens: 8192, fast_latency_ms: 1200, speed_weight: 1.5 }
 
   # Agent profiles: let named AI agents use different routing strategies.
   # An agent sends model: "<profile-name>" to select a profile.
