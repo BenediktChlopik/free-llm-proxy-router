@@ -8,10 +8,14 @@ import (
 
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/catalog"
 	"github.com/kaiser-data/free-llm-proxy-router/pkg/models"
+	"github.com/kaiser-data/free-llm-proxy-router/pkg/reliability"
 )
 
 // StrategySmart uses the most capable model that safely fits the request, while
 // keeping routing efficient and avoiding context-limit and tool-calling errors.
+//
+// It incorporates a "reliable" factor: models with poor historical success
+// are demoted, and models with proven records are prioritized.
 //
 // It works in two stages:
 //
@@ -53,7 +57,9 @@ import (
 //	failure_weight         size doublings charged for a 0% success rate (default 6; 0 ignores failures)
 //	unknown_latency_ms     latency assumed for never-measured models (default 1000)
 //	fast_latency_ms        latency at or below which no speed penalty applies (default 500)
-type StrategySmart struct{}
+type StrategySmart struct {
+	Tracker *reliability.Tracker
+}
 
 func (s *StrategySmart) Name() string { return "smart" }
 
@@ -90,7 +96,7 @@ type smartTally struct {
 func (s *StrategySmart) Rank(req Request, entries []catalog.CatalogEntry, enriched *models.EnrichedCatalog) []RankedEntry {
 	cands, _ := smartFilter(req, entries, enriched)
 	for i := range cands {
-		cands[i].score = smartScore(req, cands[i])
+		cands[i].score = smartScore(req, cands[i], s.Tracker)
 	}
 
 	sort.SliceStable(cands, func(i, j int) bool {
@@ -118,12 +124,20 @@ func (s *StrategySmart) Rank(req Request, entries []catalog.CatalogEntry, enrich
 
 // smartScore is log2 of the model size, less penalties for slowness and
 // failures when performance history is available.
-func smartScore(req Request, c smartCandidate) float64 {
+func smartScore(req Request, c smartCandidate, tracker *reliability.Tracker) float64 {
 	score := math.Log2(c.size)
-	if req.Perf == nil {
+	if req.Perf == nil && tracker == nil {
 		return score
 	}
-	latency, success, calls := req.Perf(c.entry.ProviderID, c.entry.ModelID)
+
+	var latency, success float64
+	var calls int64
+
+	if tracker != nil {
+		latency, success, calls = tracker.Perf(c.entry.ProviderID, c.entry.ModelID)
+	} else if req.Perf != nil {
+		latency, success, calls = req.Perf(c.entry.ProviderID, c.entry.ModelID)
+	}
 	fast := optFloat(req.Options, "fast_latency_ms", defaultFastLatency)
 	if fast < 1 {
 		fast = defaultFastLatency
