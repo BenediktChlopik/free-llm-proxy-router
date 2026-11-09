@@ -25,7 +25,7 @@ proxy:
   port: 8080
   auth_token: ""       # Set to require a Bearer token on incoming requests
   cache_ttl: 300       # Response cache TTL in seconds (0 to disable)
-  log_level: "info"
+  log_level: "debug"
   strategy: "smart"    # Only strategy: smart routing (filters by context fit and capabilities)
 
   strategy_overrides:

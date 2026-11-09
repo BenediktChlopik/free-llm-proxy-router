@@ -125,60 +125,36 @@ func (fc *FallbackChain) Execute(parent context.Context, req Request) (*Response
 		ctx, cancel = context.WithDeadline(parent, deadline)
 		defer cancel()
 	}
-	timedOut := func(pass int, cause error) error {
-		return fmt.Errorf("%w within %s (%d passes): %v", ErrNoProviderAvailable, maxWait, pass, cause)
+	timedOut := func(cause error) error {
+		return fmt.Errorf("%w within %s: %v", ErrNoProviderAvailable, maxWait, cause)
 	}
 
 	// Provider/model pairs that returned an empty response during this request.
-	// Later passes try every other candidate first and retry these last.
 	demoted := make(map[string]bool)
 
-	for pass := 1; ; pass++ {
-		logging.Debug("fallback: pass %d starting (max_wait=%s, max_attempts=%d)", pass, fc.Cfg.Fallback.MaxWait, fc.Cfg.Fallback.MaxAttempts)
-		passStart := time.Now()
-		resp, err := fc.executePass(ctx, req, demoted)
-		if err == nil {
-			logging.Info("fallback: success after %d pass(es)", pass)
-			return resp, nil
-		}
-		if cerr := parent.Err(); cerr != nil {
-			return nil, cerr // client went away or shutdown; nobody to answer
-		}
-		var noModel *NoEligibleModelError
-		if errors.As(err, &noModel) {
-			return nil, err // no retry can make a model eligible
-		}
-
-		// No backoff: a pass that made real provider calls is followed by the
-		// next pass immediately. Only an instant pass waits, to avoid spinning.
-		var delay time.Duration
-		if time.Since(passStart) < minRetryDelay {
-			delay = fc.retryDelay(minRetryDelay)
-		}
-		if !deadline.IsZero() {
-			remaining := time.Until(deadline)
-			if remaining <= 0 || ctx.Err() != nil {
-				return nil, timedOut(pass, err)
-			}
-			if delay > remaining {
-				delay = remaining
-			}
-		}
-		logging.Info("fallback: pass %d found no provider (%v) — retrying", pass, err)
-		if delay > 0 {
-			if serr := sleepCtx(ctx, delay); serr != nil {
-				if cerr := parent.Err(); cerr != nil {
-					return nil, cerr
-				}
-				return nil, timedOut(pass, err)
-			}
-		} else if ctx.Err() != nil {
-			if cerr := parent.Err(); cerr != nil {
-				return nil, cerr
-			}
-			return nil, timedOut(pass, err)
-		}
+	logging.Debug("fallback: execute starting (max_wait=%s, max_attempts=%d)", fc.Cfg.Fallback.MaxWait, fc.Cfg.Fallback.MaxAttempts)
+	resp, err := fc.executePass(ctx, req, demoted)
+	if err == nil {
+		logging.Info("fallback: success")
+		return resp, nil
 	}
+	if cerr := parent.Err(); cerr != nil {
+		return nil, cerr // client went away or shutdown; nobody to answer
+	}
+	var noModel *NoEligibleModelError
+	if errors.As(err, &noModel) {
+		return nil, err // no retry can make a model eligible
+	}
+	if !deadline.IsZero() && (time.Until(deadline) <= 0 || ctx.Err() != nil) {
+		return nil, timedOut(err)
+	}
+	if ctx.Err() != nil {
+		if cerr := parent.Err(); cerr != nil {
+			return nil, cerr
+		}
+		return nil, timedOut(err)
+	}
+	return nil, err
 }
 
 // retryDelay turns the base wait into the actual one: jittered ±20% to avoid
