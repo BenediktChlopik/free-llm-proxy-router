@@ -17,6 +17,10 @@ import (
 // It incorporates a "reliable" factor: models with poor historical success
 // are demoted, and models with proven records are prioritized.
 //
+// If "parallel" is configured in overrides (proxy.strategy_overrides.smart.parallel=true),
+// it will return all eligible candidates rather than just the top one, allowing
+// the fallback chain to fan out the request.
+//
 // It works in two stages:
 //
 //  1. Filter. A model is a candidate only if it
@@ -118,6 +122,17 @@ func (s *StrategySmart) Rank(req Request, entries []catalog.CatalogEntry, enrich
 			ModelID:    c.entry.ModelID,
 			Score:      -c.score,
 		})
+	}
+
+	if opt := optInt(req.Options, "parallel", 0); opt > 0 {
+		if len(ranked) > opt {
+			ranked = ranked[:opt]
+		}
+	}
+	if opt := optInt(req.Options, "agents", 0); opt > 0 {
+		if len(ranked) > opt {
+			ranked = ranked[:opt]
+		}
 	}
 	return ranked
 }
@@ -324,6 +339,11 @@ func optInt(o map[string]any, key string, def int) int {
 		return int(v)
 	case float64:
 		return int(v)
+	case bool:
+		if v {
+			return 3 // Default fan-out when just "parallel: true"
+		}
+		return 0
 	}
 	return def
 }

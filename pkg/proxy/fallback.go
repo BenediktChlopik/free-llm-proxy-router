@@ -229,10 +229,11 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 		maxAttempts = 5
 	}
 
-	// The parallel strategy is a real first-response-wins fan-out. Candidate
-	// selection is bounded by the strategy's fan_out setting, and all requests
+	// The parallel strategy or a strategy configured with parallel fan-out
+	// is a real first-response-wins fan-out. Candidate selection is bounded by
+	// the strategy's fan_out / parallel setting or maxAttempts, and all requests
 	// share a cancellable context so slow losers stop as soon as one succeeds.
-	if fc.Strategy.Name() == "parallel" {
+	if fc.Strategy.Name() == "parallel" || fc.isParallelOverride() {
 		resp, err := fc.executeParallelPass(ctx, req, stratReq, ranked, maxAttempts)
 		if err != nil {
 			return nil, err
@@ -249,7 +250,7 @@ func (fc *FallbackChain) executePass(ctx context.Context, req Request, demoted m
 				return fallbackResp, nil
 			}
 		}
-		return nil, fmt.Errorf("no provider answered in this parallel pass (%d candidates)", maxAttempts)
+		return nil, fmt.Errorf("no provider answered in this parallel/async pass (%d candidates)", maxAttempts)
 	}
 
 	// Steps 1–4: OpenRouter models[] first, then one model per provider in
@@ -640,6 +641,24 @@ func hasContent(v any) bool {
 				return true // non-text part (image, audio, …)
 			}
 		}
+	}
+	return false
+}
+
+func (fc *FallbackChain) isParallelOverride() bool {
+	if fc.Strategy == nil {
+		return false
+	}
+	opts := fc.Cfg.Proxy.StrategyOverrides[fc.Strategy.Name()]
+	switch v := opts["parallel"].(type) {
+	case int:
+		return v > 0
+	case int64:
+		return v > 0
+	case float64:
+		return v > 0
+	case bool:
+		return v
 	}
 	return false
 }

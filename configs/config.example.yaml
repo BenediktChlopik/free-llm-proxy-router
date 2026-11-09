@@ -35,7 +35,9 @@ proxy:
     #   output_reserve_tokens   reply budget when the client sends no max_tokens
     #   unknown_context_tokens  window assumed for models whose context size is not in the catalog
     #   max_tokens_cap          cap applied to max_tokens (the fit check uses it as the reply budget)
-    smart:         { safety_margin: 1.15, output_reserve_tokens: 1024, unknown_context_tokens: 8192, fast_latency_ms: 1200, speed_weight: 1.5 }
+    #   parallel                number of concurrent requests to fan out (0 or false to disable)
+    #   agents                  alias for parallel, preferred for multi-agent workloads
+    smart:         { safety_margin: 1.15, output_reserve_tokens: 1024, unknown_context_tokens: 8192, fast_latency_ms: 1200, speed_weight: 1.5, parallel: false, agents: 0 }
 
   # Agent profiles: let named AI agents use different routing strategies.
   # An agent sends model: "<profile-name>" to select a profile.
@@ -75,9 +77,11 @@ proxy:
         temperature: 0.5
 
     # Tool-using agent: only models that fit the prompt and can call tools,
-    # largest first; fallback never leaves that set
+    # largest first; fallback never leaves that set.
+    # parallel: true enables asynchronous fan-out to the top candidates.
     agent:
       strategy: "smart"
+      parallel: true
 
     # Pinned high-quality model for token-efficient subtasks
     # Usage: ask-precise "your question"
