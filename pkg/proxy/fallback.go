@@ -94,18 +94,17 @@ func (e *NoEligibleModelError) Error() string { return e.Reason }
 // just failed returned almost instantly (every candidate skipped on cooldown,
 // no provider call made). It keeps such a pass from turning into a busy loop.
 // A pass that actually called providers is followed by the next one at once.
-const minRetryDelay = 100 * time.Millisecond
+const minRetryDelay = 10 * time.Millisecond
 
 // Execute runs the fallback chain for the given request until a provider
 // returns a real response.
 //
 // A single pass over the chain (executePass) is bounded by Fallback.MaxAttempts.
-// When a pass finds no provider that answers, Execute waits (exponential
-// backoff with jitter, shortened to the next cooldown expiry) and starts a new
-// pass with the unmodified original request. It never fabricates a
-// completion: it returns either an upstream response, ctx.Err() when the
-// client went away, or — only if Fallback.MaxWait is set and exceeded —
-// ErrNoProviderAvailable.
+// When a pass finds no provider that answers, Execute waits (shortened to the
+// next cooldown expiry) and starts a new pass with the unmodified original
+// request. It never fabricates a completion: it returns either an upstream
+// response, ctx.Err() when the client went away, or — only if Fallback.MaxWait
+// is set and exceeded — ErrNoProviderAvailable.
 //
 // Fallback.MaxWait is a hard cap on the whole call: it is applied as a deadline
 // to every provider request and wait, so an in-flight call is cut off when the
@@ -133,28 +132,47 @@ func (fc *FallbackChain) Execute(parent context.Context, req Request) (*Response
 	demoted := make(map[string]bool)
 
 	logging.Debug("fallback: execute starting (max_wait=%s, max_attempts=%d)", fc.Cfg.Fallback.MaxWait, fc.Cfg.Fallback.MaxAttempts)
-	resp, err := fc.executePass(ctx, req, demoted)
-	if err == nil {
-		logging.Info("fallback: success")
-		return resp, nil
-	}
-	if cerr := parent.Err(); cerr != nil {
-		return nil, cerr // client went away or shutdown; nobody to answer
-	}
-	var noModel *NoEligibleModelError
-	if errors.As(err, &noModel) {
-		return nil, err // no retry can make a model eligible
-	}
-	if !deadline.IsZero() && (time.Until(deadline) <= 0 || ctx.Err() != nil) {
-		return nil, timedOut(err)
-	}
-	if ctx.Err() != nil {
-		if cerr := parent.Err(); cerr != nil {
-			return nil, cerr
+
+	// Loop: keep trying passes until we get a real answer, the client
+	// disconnects, or MaxWait elapses.
+	backoff := 250 * time.Millisecond // initial backoff
+	for {
+		resp, err := fc.executePass(ctx, req, demoted)
+		if err == nil {
+			logging.Info("fallback: success")
+			return resp, nil
 		}
-		return nil, timedOut(err)
+		if cerr := parent.Err(); cerr != nil {
+			return nil, cerr // client went away or shutdown; nobody to answer
+		}
+		var noModel *NoEligibleModelError
+		if errors.As(err, &noModel) {
+			return nil, err // no retry can make a model eligible
+		}
+
+		// Check if we've exceeded the deadline
+		if !deadline.IsZero() {
+			if time.Until(deadline) <= 0 || ctx.Err() != nil {
+				return nil, timedOut(err)
+			}
+		}
+
+		// Wait before the next pass (jittered, shortened to next cooldown expiry)
+		wait := fc.retryDelay(backoff)
+		// Exponential backoff capped at 2 seconds for subsequent passes
+		backoff *= 2
+		if backoff > 2*time.Second {
+			backoff = 2 * time.Second
+		}
+
+		logging.Debug("fallback: no provider answered, waiting %s before next pass: %v", wait, err)
+		if serr := sleepCtx(ctx, wait); serr != nil {
+			if cerr := parent.Err(); cerr != nil {
+				return nil, cerr
+			}
+			return nil, timedOut(serr)
+		}
 	}
-	return nil, err
 }
 
 // retryDelay turns the base wait into the actual one: jittered ±20% to avoid
