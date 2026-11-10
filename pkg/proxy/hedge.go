@@ -233,7 +233,27 @@ func (fc *FallbackChain) runCandidates(ctx context.Context, req Request, stratRe
 			return nil, true, ctx.Err()
 		}
 
+		if callErr == nil && resp.StatusCode == http.StatusTooManyRequests {
+			// The provider itself is 429-ing on this model.
+			// Mark the provider as failed to stop trying its other models for this pass.
+			failedProviders[r.ProviderID] = true
+			
+			logging.Debug("fallback: %s/%s status 429 — skipping provider due to rate limit%s", r.ProviderID, r.ModelID, upstreamErrSnippet(resp, callErr))
+			
+			// Model-level failures say nothing about the provider's health, so
+			// only auth and transport errors count against its reliability.
+			// Re-check reliability for 429s.
+			// (Note: modelLevel/accountLevel not yet defined here, rely on status code)
+			fc.ReliabilityTracker.Record(r.ProviderID, false)
+			if fc.ReliabilityTracker.ShouldCooldown(r.ProviderID) {
+				fc.RateLimiter.SetCooldown(r.ProviderID, time.Now().Add(30*time.Second))
+				logging.Warn("fallback: %s reliability below 50%% — short cooldown", r.ProviderID)
+			}
+			return nil, false, nil
+		}
+		
 		modelLevel, accountLevel := fc.applyFailureEffects(r, res.provider, resp)
+		
 		statusCode := 0
 		if resp != nil {
 			statusCode = resp.StatusCode
