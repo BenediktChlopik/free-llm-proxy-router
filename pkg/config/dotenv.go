@@ -35,6 +35,7 @@ func loadDotenv(paths ...string) {
 		if err != nil {
 			continue // file absent is fine
 		}
+
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
@@ -49,6 +50,8 @@ func loadDotenv(paths ...string) {
 				merged[k] = v // first file wins
 			}
 		}
+		// Must check scanner.Err() after the loop
+		_ = scanner.Err()
 		f.Close()
 	}
 

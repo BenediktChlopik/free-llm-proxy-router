@@ -167,13 +167,8 @@ func probeCmd() *cobra.Command {
 			}
 			jobs := make(chan probeJob)
 			results := make(chan probeResult, len(pending))
-			workerCount := workers
-			if workerCount < 1 {
-				workerCount = 1
-			}
-			if workerCount > len(pending) {
-				workerCount = len(pending)
-			}
+			workerCount := min(max(workers, 1), len(pending))
+
 			ctx := cmd.Context()
 			var wg sync.WaitGroup
 			for i := 0; i < workerCount; i++ {

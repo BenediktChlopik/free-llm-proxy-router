@@ -3,6 +3,7 @@ package catalog
 
 import (
 	"encoding/json"
+	"slices"
 	"sync"
 	"time"
 )
@@ -63,10 +64,8 @@ func (c *Catalog) Block(providerID, modelID string) {
 
 func (c *Catalog) blockLocked(providerID, modelID string) {
 	key := providerID + "/" + modelID
-	for _, b := range c.Blocklist {
-		if b == key {
-			return
-		}
+	if slices.Contains(c.Blocklist, key) {
+		return
 	}
 	c.Blocklist = append(c.Blocklist, key)
 }
