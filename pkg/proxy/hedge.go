@@ -240,10 +240,7 @@ func (fc *FallbackChain) runCandidates(ctx context.Context, req Request, stratRe
 			
 			logging.Debug("fallback: %s/%s status 429 — skipping provider due to rate limit%s", r.ProviderID, r.ModelID, upstreamErrSnippet(resp, callErr))
 			
-			// Model-level failures say nothing about the provider's health, so
-			// only auth and transport errors count against its reliability.
-			// Re-check reliability for 429s.
-			// (Note: modelLevel/accountLevel not yet defined here, rely on status code)
+			// Count 429 towards reliability to potentially trigger switching.
 			fc.ReliabilityTracker.Record(r.ProviderID, false)
 			if fc.ReliabilityTracker.ShouldCooldown(r.ProviderID) {
 				fc.RateLimiter.SetCooldown(r.ProviderID, time.Now().Add(30*time.Second))
@@ -267,7 +264,9 @@ func (fc *FallbackChain) runCandidates(ctx context.Context, req Request, stratRe
 		logging.Debug("fallback: %s/%s status %d — skipping provider%s", r.ProviderID, r.ModelID, statusCode, upstreamErrSnippet(resp, callErr))
 		// Model-level failures say nothing about the provider's health, so
 		// only auth and transport errors count against its reliability.
-		if !modelLevel && !accountLevel {
+		// 429 errors now also count against provider reliability to trigger 
+		// provider switching.
+		if !modelLevel && !accountLevel || (resp != nil && resp.StatusCode == http.StatusTooManyRequests) {
 			fc.ReliabilityTracker.Record(r.ProviderID, false)
 			if fc.ReliabilityTracker.ShouldCooldown(r.ProviderID) {
 				fc.RateLimiter.SetCooldown(r.ProviderID, time.Now().Add(30*time.Second))
